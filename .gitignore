@@ -1,0 +1,11 @@
+dist/
+node_modules/
+*.tmp
+*.temp
+*~
+test/captured-requests.json
+test/last-capture.json
+test/last-run.log
+test/model-dropdown.png
+test/native-model-capture.json
+test/screenshots/*.png
