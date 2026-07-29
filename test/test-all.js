@@ -524,7 +524,7 @@ async function testFusionOutput(page) {
     fusionState.fusionModel === fusionState.originalModel,
     `Fusion judge uses current model (${fusionState.fusionModel})`
   );
-  assert(fusionState.fusionPrompt.includes('Independent candidate answers'), 'Fusion prompt contains panel answers');
+  assert(fusionState.fusionPrompt.includes('CANDIDATE_ANSWERS (JSON)'), 'Fusion prompt contains panel answers');
 }
 
 // ─── T5: Auto-reload is optional (default OFF) ──────────────────
