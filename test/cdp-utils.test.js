@@ -1,6 +1,6 @@
 const assert = require('assert')
 const http = require('http')
-const { isCdpAlive } = require('./cdp-utils')
+const { isCdpAlive, findCdpEndpoint } = require('./cdp-utils')
 
 function withServer(handler) {
   return new Promise((resolve, reject) => {
@@ -50,6 +50,10 @@ async function testAcceptsDevToolsVersionResponse() {
   })
   try {
     assert.strictEqual(await isCdpAlive(server.port), true)
+    assert.strictEqual(
+      await findCdpEndpoint(server.port, '127.0.0.1'),
+      `http://127.0.0.1:${server.port}`
+    )
   } finally {
     await server.close()
   }

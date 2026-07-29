@@ -1,8 +1,12 @@
 const http = require('http')
 
-function isCdpAlive(port) {
+function formatCdpHost(host) {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+}
+
+function isCdpAlive(port, host = '127.0.0.1') {
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+    const req = http.get(`http://${formatCdpHost(host)}:${port}/json/version`, (res) => {
       let body = ''
       res.on('data', (chunk) => {
         body += chunk
@@ -29,4 +33,14 @@ function isCdpAlive(port) {
   })
 }
 
-module.exports = { isCdpAlive }
+async function findCdpEndpoint(port, preferredHost) {
+  const hosts = [...new Set([preferredHost, '::1', '127.0.0.1'].filter(Boolean))]
+  for (const host of hosts) {
+    if (await isCdpAlive(port, host)) {
+      return `http://${formatCdpHost(host)}:${port}`
+    }
+  }
+  return null
+}
+
+module.exports = { isCdpAlive, findCdpEndpoint }

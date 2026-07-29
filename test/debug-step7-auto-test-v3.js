@@ -1,5 +1,5 @@
 // Auto-test v3: fresh chat, send message, wait, screenshot
-const { chromium } = require('C:/Users/Kang/AppData/Roaming/npm/node_modules/@playwright/cli/node_modules/playwright');
+const { chromium } = require('./playwright-runtime');
 
 (async () => {
   const browser = await chromium.connectOverCDP('http://localhost:9222');

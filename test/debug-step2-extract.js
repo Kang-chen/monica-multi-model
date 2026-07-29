@@ -1,5 +1,5 @@
 // Phase 1.5: Extract captured requests from the debug Chrome
-const { chromium } = require('C:/Users/Kang/AppData/Roaming/npm/node_modules/@playwright/cli/node_modules/playwright');
+const { chromium } = require('./playwright-runtime');
 const fs = require('fs');
 
 (async () => {
