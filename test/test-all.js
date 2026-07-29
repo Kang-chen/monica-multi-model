@@ -1,14 +1,15 @@
 /**
  * Monica Multi-Model Compare — End-to-End Test Suite
  *
- * Tests all 6 requirements from the plan:
+ * Tests all 7 requirements from the plan:
  *   T1: Version number is build-incremented (not runtime timestamp)
  *   T2: Build script produces dist/ output and syncs to Tampermonkey
  *   T3: Model switch works for Gemini 3.5 Flash / GPT-5.5 / Claude 5 Sonnet
- *       with sequential requests (no 11136 rate-limit errors)
+ *       with staggered concurrent requests
  *   T4: Plugin panel shows streaming output for each model
  *   T5: Auto-reload is an option (default OFF), not forced
  *   T6: Plugin UI persists after page refresh
+ *   T7: Fusion uses the current Monica model and renders without refreshing
  *
  * Usage:
  *   node test/test-all.js
@@ -21,15 +22,16 @@
  *   - Monica logged in at the debug profile
  */
 
-const { chromium } = require('C:/Users/Kang/AppData/Roaming/npm/node_modules/@playwright/cli/node_modules/playwright');
+const { chromium } = require('./playwright-runtime');
 const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { isCdpAlive } = require('./cdp-utils');
+const { findCdpEndpoint } = require('./cdp-utils');
 
 // ─── config ─────────────────────────────────────────────────────
 const CHROME_PATH = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const CDP_PORT = Number(process.env.CDP_PORT || 9222);
+const CDP_HOST = process.env.CDP_HOST || '';
 const USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR || 'C:/tmp/chrome-debug-profile';
 const EXTRA_CHROME_ARGS = (process.env.CHROME_EXTRA_ARGS || '').split(/\s+/).filter(Boolean);
 const SCREENSHOTS = path.join(__dirname, 'screenshots');
@@ -46,9 +48,10 @@ const results = [];
 // ─── Chrome lifecycle ───────────────────────────────────────────
 
 async function ensureChrome() {
-  if (await isCdpAlive(CDP_PORT)) {
-    console.log(`Chrome CDP already listening on port ${CDP_PORT}`);
-    return { chromeProcess: null, launched: false };
+  let endpoint = await findCdpEndpoint(CDP_PORT, CDP_HOST);
+  if (endpoint) {
+    console.log(`Chrome CDP already listening at ${endpoint}`);
+    return { chromeProcess: null, launched: false, endpoint };
   }
 
   console.log('Launching Chrome with remote debugging...');
@@ -68,9 +71,10 @@ async function ensureChrome() {
 
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 500));
-    if (await isCdpAlive(CDP_PORT)) {
+    endpoint = await findCdpEndpoint(CDP_PORT, CDP_HOST);
+    if (endpoint) {
       console.log(`Chrome CDP ready after ${((i + 1) * 500 / 1000).toFixed(1)}s`);
-      return { chromeProcess, launched: true };
+      return { chromeProcess, launched: true, endpoint };
     }
   }
   throw new Error('Chrome failed to start within 15s');
@@ -127,14 +131,16 @@ function buildInjectableScript() {
 
   const testReset = `
     // --- Test reset: prefer the local userscript over any stale Tampermonkey copy ---
-    const resetToken = 'canonical-models-2026-07-01';
-    if (sessionStorage.getItem('__monica_mm_test_reset_token') !== resetToken) {
-      localStorage.removeItem('__gm_store__');
-      sessionStorage.setItem('__monica_mm_test_reset_token', resetToken);
-    }
-    delete window.__monica_mm_initialized;
-    document.getElementById('monica-mm-toggle')?.remove();
-    document.getElementById('monica-mm-host')?.remove();
+    (function() {
+      const resetToken = 'canonical-models-2026-07-01';
+      if (sessionStorage.getItem('__monica_mm_test_reset_token') !== resetToken) {
+        localStorage.removeItem('__gm_store__');
+        sessionStorage.setItem('__monica_mm_test_reset_token', resetToken);
+      }
+      delete window.__monica_mm_initialized;
+      document.getElementById('monica-mm-toggle')?.remove();
+      document.getElementById('monica-mm-host')?.remove();
+    })();
   `;
 
   return testReset + '\n' + gmStubs + '\n' + src;
@@ -264,7 +270,7 @@ async function testBuildScript() {
   assert(verAfter.build === buildBefore + 1, `Build number incremented from ${buildBefore} to ${verAfter.build}`);
 }
 
-// ─── T3: Model switch with sequential requests ─────────────────
+// ─── T3: Model switch with staggered concurrent requests ───────
 async function testModelSwitch(page) {
   console.log('\n=== T3: Model switch works (Gemini 3.5 Flash / GPT-5.5 / Claude 5 Sonnet) ===');
 
@@ -310,7 +316,7 @@ async function testModelSwitch(page) {
 
     window.addEventListener('message', (event) => {
       if (event.data?.type === 'MONICA_MM_REPLAY_REQUEST') {
-        const { modelLabel, modelId } = event.data.payload;
+        const { modelLabel, modelId, source } = event.data.payload;
         let bodyParsed = null;
         try { bodyParsed = JSON.parse(event.data.payload.body); } catch(e) {}
         window.__testCapture.requests.push({
@@ -319,6 +325,8 @@ async function testModelSwitch(page) {
           trigger_by: bodyParsed?.data?.trigger_by,
           bodyParsed,
           modelLabel: modelLabel,
+          logicalModelId: modelId,
+          source: source || 'panel',
           type: 'replay',
         });
       }
@@ -376,11 +384,13 @@ async function testModelSwitch(page) {
         ? targetModelIds.length - 1
         : targetModelIds.length;
       const doneCount = Object.values(attrs).filter(v => v === 'done' || v === 'error').length;
-      return { replayCount, doneCount, expectedReplayCount, attrs };
+      const root = document.getElementById('monica-mm-host')?.shadowRoot;
+      const fusionStatus = root?.querySelector('.mm-fusion-panel .mm-panel-status')?.textContent || '';
+      return { replayCount, doneCount, expectedReplayCount, attrs, fusionStatus };
     }, Array.from(TARGET_MODEL_IDS));
     console.log(`  ... ${status.replayCount} replays sent, ${status.doneCount}/${status.expectedReplayCount} completed (${Math.round((Date.now() - startTime) / 1000)}s)`);
-    if (status.doneCount >= status.expectedReplayCount) {
-      console.log(`  All expected replay models completed after ${Math.round((Date.now() - startTime) / 1000)}s`);
+    if (status.fusionStatus === 'done' || status.fusionStatus.includes('error') || status.fusionStatus.includes('skipped')) {
+      console.log(`  Panel and Fusion flow completed after ${Math.round((Date.now() - startTime) / 1000)}s`);
       break;
     }
   }
@@ -417,6 +427,7 @@ async function testModelSwitch(page) {
     coveredTargetModels.add(originalReq.use_model);
   }
   testRun.expectedReplayCount = expectedReplayCount;
+  testRun.capture = capture;
 
   assert(reqCount >= 1 + expectedReplayCount, `Captured ${reqCount} requests (expected >= ${1 + expectedReplayCount}: 1 original + ${expectedReplayCount} replays)`);
   assert(replayReqs.length >= expectedReplayCount, `${replayReqs.length} replay requests sent (expected ${expectedReplayCount})`);
@@ -424,11 +435,12 @@ async function testModelSwitch(page) {
   assert(doneModels.length >= expectedReplayCount, `${doneModels.length} replay models completed streaming`);
   assert(errorModels.length === 0, `No stream errors (${errorModels.length} errors found)`);
 
-  // Check request timing — should be sequential
-  if (replayReqs.length >= 3) {
-    const timestamps = replayReqs.map(r => r.timestamp);
+  // Check request timing — panel requests should overlap
+  const panelReplayReqs = replayReqs.filter(r => r.source !== 'fusion');
+  if (panelReplayReqs.length >= 2) {
+    const timestamps = panelReplayReqs.map(r => r.timestamp);
     const totalSpan = timestamps[timestamps.length - 1] - timestamps[0];
-    assert(totalSpan > 5000, `Requests are sequential (span: ${totalSpan}ms, expected >5000ms)`);
+    assert(totalSpan < 3000, `Panel requests are staggered-concurrent (start span: ${totalSpan}ms)`);
   }
 
   // Screenshot
@@ -484,6 +496,37 @@ async function testPanelOutput(page) {
   }
 }
 
+async function testFusionOutput(page) {
+  console.log('\n=== T7: Fusion uses current model and renders in-place ===');
+
+  const fusionState = await page.evaluate(() => {
+    const root = document.getElementById('monica-mm-host')?.shadowRoot;
+    const panel = root?.querySelector('.mm-fusion-panel');
+    const capture = window.__testCapture || { requests: [] };
+    const original = capture.requests.find(r => r.type === 'original');
+    const fusion = capture.requests.find(r => r.type === 'replay' && r.source === 'fusion');
+    return {
+      panelExists: !!panel,
+      status: panel?.querySelector('.mm-panel-status')?.textContent || '',
+      text: panel?.querySelector('.mm-panel-content')?.textContent || '',
+      originalModel: original?.use_model,
+      fusionModel: fusion?.use_model,
+      fusionPrompt: fusion?.bodyParsed?.data?.items
+        ?.filter(item => item.item_type === 'question')
+        ?.at(-1)?.data?.content || '',
+    };
+  });
+
+  assert(fusionState.panelExists, 'Fusion panel exists in the current page');
+  assert(fusionState.status === 'done', `Fusion completed (status: ${fusionState.status})`);
+  assert(fusionState.text.length > 0, `Fusion rendered a non-empty result (${fusionState.text.length} chars)`);
+  assert(
+    fusionState.fusionModel === fusionState.originalModel,
+    `Fusion judge uses current model (${fusionState.fusionModel})`
+  );
+  assert(fusionState.fusionPrompt.includes('Independent candidate answers'), 'Fusion prompt contains panel answers');
+}
+
 // ─── T5: Auto-reload is optional (default OFF) ──────────────────
 async function testAutoReloadOption() {
   console.log('\n=== T5: Auto-reload is optional (default OFF) ===');
@@ -522,9 +565,9 @@ async function testUIAfterRefresh(page) {
   });
   assert(beforeRefresh.toggleExists, 'Toggle button exists BEFORE refresh');
 
-  // Refresh the page (addInitScript persists across navigations)
+  // Refresh the page. addInitScript simulates Tampermonkey's document-start
+  // injection; do not manually inject again here, or the test masks refresh bugs.
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-  await injectCurrentUserscript(page);
   await page.waitForTimeout(5000);
 
   // Wait for toggle to reappear
@@ -566,8 +609,8 @@ async function testUIAfterRefresh(page) {
   // T3-T6 need browser — auto-launch Chrome if not already running
   let browser;
   try {
-    await ensureChrome();
-    browser = await chromium.connectOverCDP(`http://localhost:${CDP_PORT}`);
+    const chrome = await ensureChrome();
+    browser = await chromium.connectOverCDP(chrome.endpoint);
     console.log('Connected to Chrome via CDP');
   } catch (e) {
     console.error(`\nFailed to connect to Chrome: ${e.message}`);
@@ -585,6 +628,7 @@ async function testUIAfterRefresh(page) {
 
     await testModelSwitch(page);
     await testPanelOutput(page);
+    await testFusionOutput(page);
     await testAutoReloadOption();
     await testUIAfterRefresh(page);
   } catch (e) {

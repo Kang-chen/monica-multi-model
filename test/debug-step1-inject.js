@@ -1,5 +1,5 @@
 // Phase 1: Connect to debug Chrome via CDP, navigate to Monica, inject request capture
-const { chromium } = require('C:/Users/Kang/AppData/Roaming/npm/node_modules/@playwright/cli/node_modules/playwright');
+const { chromium } = require('./playwright-runtime');
 
 (async () => {
   const browser = await chromium.connectOverCDP('http://localhost:9222');

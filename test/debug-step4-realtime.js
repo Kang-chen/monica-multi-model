@@ -1,6 +1,6 @@
 // Re-inject interceptor + listen for console in real-time
 // Run this BEFORE sending a message in Monica
-const { chromium } = require('C:/Users/Kang/AppData/Roaming/npm/node_modules/@playwright/cli/node_modules/playwright');
+const { chromium } = require('./playwright-runtime');
 
 (async () => {
   const browser = await chromium.connectOverCDP('http://localhost:9222');
