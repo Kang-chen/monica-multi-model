@@ -11,6 +11,7 @@
 // @grant        GM_registerMenuCommand
 // @require      https://cdn.jsdelivr.net/npm/markdown-it@14.3.0/dist/markdown-it.min.js#sha256-cP4XvQbH+oGfA6HtEJV5BDGBA2JBmIRdyJOzCb9JXig=
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.4.7/dist/purify.min.js#sha256-+E5SKHamz63suJwXM1ZAms7Dn1gMaQGFWcmlDpYpmww=
+// @require      https://cdn.jsdelivr.net/npm/katex@0.18.0/dist/katex.min.js#sha384-OE4SMRr5gMJQzKSD08J46vKsKgY8NxVtO1LW+/q3NJ0WHsGsdN4oebgEjwwWuyvG
 // @run-at       document-start
 // @connect      monica.im
 // @connect      *.monica.im
@@ -36,8 +37,16 @@
   const STORAGE_KEY_AUTO_RELOAD = `${SCRIPT_ID}-auto-reload`
   const STORAGE_KEY_FUSION_ENABLED = `${SCRIPT_ID}-fusion-enabled`
   const STORAGE_KEY_FUSION_AUTO_RUN = `${SCRIPT_ID}-fusion-auto-run`
+  const STORAGE_KEY_FUSION_MODEL = `${SCRIPT_ID}-fusion-model`
+  const STORAGE_KEY_PANEL_OPACITY = `${SCRIPT_ID}-panel-opacity`
+  const STORAGE_KEY_PANEL_POSITION = `${SCRIPT_ID}-panel-position`
+  const STORAGE_KEY_PANEL_SIZE = `${SCRIPT_ID}-panel-size`
+  const SESSION_KEY_RUN_SNAPSHOT = `${SCRIPT_ID}-run-snapshot`
+  const RUN_SNAPSHOT_VERSION = 1
   const FUSION_MODEL_ID = '__fusion__'
+  const FUSION_MODEL_AUTO = 'auto'
   const PANEL_TIMEOUT_MS = 120000
+  const DEFAULT_PANEL_OPACITY = 42
 
   /**
    * Default models — configured with Monica's internal model IDs.
@@ -59,6 +68,10 @@
   ]
 
   const DEFAULT_STAGGER_MS = 200
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value))
+  }
 
   const MODEL_ALIASES = {
     'gemini-3.5-flash': { id: 'gemini-3.5-flash-thinking', chatModel: 'gemini_3_5_flash', label: 'Gemini 3.5 Flash' },
@@ -130,24 +143,40 @@
     return normalized
   }
 
+  function normalizeFusionModelId(modelId, models) {
+    const requestedId = String(modelId || FUSION_MODEL_AUTO)
+    return requestedId === FUSION_MODEL_AUTO || models.some((model) => model.id === requestedId)
+      ? requestedId
+      : FUSION_MODEL_AUTO
+  }
+
   // ============================================================
   // 2. State
   // ============================================================
 
+  const loadedModels = loadModels()
   const state = {
     enabled: GM_getValue(STORAGE_KEY_ENABLED, false),
-    models: loadModels(),
+    models: loadedModels,
     endpointPattern: GM_getValue(STORAGE_KEY_ENDPOINT, '/api/custom_bot/chat'),
     staggerMs: GM_getValue(STORAGE_KEY_STAGGER, DEFAULT_STAGGER_MS),
     autoReload: GM_getValue(STORAGE_KEY_AUTO_RELOAD, false),
     fusionEnabled: GM_getValue(STORAGE_KEY_FUSION_ENABLED, true),
     fusionAutoRun: GM_getValue(STORAGE_KEY_FUSION_AUTO_RUN, true),
+    fusionModelId: normalizeFusionModelId(
+      GM_getValue(STORAGE_KEY_FUSION_MODEL, FUSION_MODEL_AUTO),
+      loadedModels,
+    ),
+    panelOpacity: clamp(Number(GM_getValue(STORAGE_KEY_PANEL_OPACITY, DEFAULT_PANEL_OPACITY)), 20, 75),
+    panelPosition: GM_getValue(STORAGE_KEY_PANEL_POSITION, null),
+    panelSize: GM_getValue(STORAGE_KEY_PANEL_SIZE, null),
     panelVisible: false,
     panels: new Map(), // model id → { container, content, status }
     lastCapturedRequest: null, // { url, headers, body }
     activeRun: null,
     activePanelId: null,
   }
+  let runSnapshotTimer = null
 
   function persistState() {
     GM_setValue(STORAGE_KEY_ENABLED, state.enabled)
@@ -157,6 +186,172 @@
     GM_setValue(STORAGE_KEY_AUTO_RELOAD, state.autoReload)
     GM_setValue(STORAGE_KEY_FUSION_ENABLED, state.fusionEnabled)
     GM_setValue(STORAGE_KEY_FUSION_AUTO_RUN, state.fusionAutoRun)
+    GM_setValue(STORAGE_KEY_FUSION_MODEL, state.fusionModelId)
+    GM_setValue(STORAGE_KEY_PANEL_OPACITY, state.panelOpacity)
+    GM_setValue(STORAGE_KEY_PANEL_POSITION, state.panelPosition)
+    GM_setValue(STORAGE_KEY_PANEL_SIZE, state.panelSize)
+  }
+
+  function getRunPageKey() {
+    try {
+      const url = new URL(location.href)
+      url.hash = ''
+      return `${url.origin}${url.pathname}${url.search}`
+    } catch {
+      return location.href
+    }
+  }
+
+  function serializeResponse(response) {
+    return {
+      modelId: String(response?.modelId || ''),
+      modelLabel: String(response?.modelLabel || ''),
+      uiMode: String(response?.uiMode || 'unknown'),
+      finalText: String(response?.finalText || ''),
+      thinkingText: String(response?.thinkingText || ''),
+      status: String(response?.status || 'waiting'),
+      error: response?.error ? String(response.error) : null,
+      startedAt: Number(response?.startedAt) || null,
+      finishedAt: Number(response?.finishedAt) || null,
+      retryCount: Number(response?.retryCount) || 0,
+      scrollTop: Number(response?.scrollTop) || 0,
+    }
+  }
+
+  function saveRunSnapshotNow() {
+    if (runSnapshotTimer) {
+      clearTimeout(runSnapshotTimer)
+      runSnapshotTimer = null
+    }
+    const run = state.activeRun
+    if (!run) return
+
+    const activePanel = state.panels.get(state.activePanelId)
+    const activeResponse = run.responses.get(state.activePanelId)
+    if (activePanel && activeResponse) activeResponse.scrollTop = activePanel.content.scrollTop
+
+    const hasInFlightResponse = [...run.responses.values()]
+      .some((response) => response.status === 'waiting' || response.status === 'streaming')
+    if (hasInFlightResponse) run.pageKey = getRunPageKey()
+
+    const snapshot = {
+      version: RUN_SNAPSHOT_VERSION,
+      pageKey: run.pageKey || getRunPageKey(),
+      savedAt: Date.now(),
+      runId: run.id,
+      originalQuestion: String(run.originalQuestion || ''),
+      currentModel: run.currentModel,
+      judgeModel: run.judgeModel,
+      fusionModelId: String(run.fusionModelId || FUSION_MODEL_AUTO),
+      panelModels: run.panelModels,
+      responses: [...run.responses.values()].map(serializeResponse),
+      fusionRequested: !!run.fusionRequested,
+      fusionPrompt: String(run.fusionPrompt || ''),
+      activePanelId: state.activePanelId,
+    }
+
+    try {
+      sessionStorage.setItem(SESSION_KEY_RUN_SNAPSHOT, JSON.stringify(snapshot))
+    } catch (error) {
+      console.warn(`[${SCRIPT_ID}] Unable to save result snapshot:`, error)
+    }
+  }
+
+  function scheduleRunSnapshotSave() {
+    if (!state.activeRun || runSnapshotTimer) return
+    runSnapshotTimer = setTimeout(saveRunSnapshotNow, 120)
+  }
+
+  function restoreRunSnapshot() {
+    let snapshot
+    try {
+      const raw = sessionStorage.getItem(SESSION_KEY_RUN_SNAPSHOT)
+      if (!raw) return false
+      snapshot = JSON.parse(raw)
+    } catch (error) {
+      try {
+        sessionStorage.removeItem(SESSION_KEY_RUN_SNAPSHOT)
+      } catch {}
+      console.warn(`[${SCRIPT_ID}] Ignoring invalid result snapshot:`, error)
+      return false
+    }
+
+    if (
+      snapshot?.version !== RUN_SNAPSHOT_VERSION
+      || snapshot.pageKey !== getRunPageKey()
+      || !Array.isArray(snapshot.panelModels)
+      || !Array.isArray(snapshot.responses)
+    ) {
+      return false
+    }
+
+    const panelModels = snapshot.panelModels
+      .filter((model) => model?.id && model?.label)
+      .map((model) => ({
+        id: String(model.id),
+        chatModel: String(model.chatModel || model.id),
+        label: String(model.label),
+        uiMode: String(model.uiMode || 'unknown'),
+        enabled: true,
+      }))
+    if (!panelModels.length) return false
+
+    const responses = new Map()
+    for (const stored of snapshot.responses) {
+      if (!stored?.modelId) continue
+      const status = ['waiting', 'streaming'].includes(stored.status) ? 'interrupted' : stored.status
+      responses.set(String(stored.modelId), {
+        ...serializeResponse(stored),
+        status,
+      })
+    }
+    for (const model of panelModels) {
+      if (!responses.has(model.id)) responses.set(model.id, createResponseRecord(model))
+    }
+
+    const judgeModel = snapshot.judgeModel?.id
+      ? {
+          id: String(snapshot.judgeModel.id),
+          chatModel: String(snapshot.judgeModel.chatModel || snapshot.judgeModel.id),
+          label: String(snapshot.judgeModel.label || snapshot.judgeModel.id),
+          uiMode: String(snapshot.judgeModel.uiMode || 'unknown'),
+          enabled: false,
+        }
+      : panelModels[0]
+    const currentModel = snapshot.currentModel?.id
+      ? {
+          id: String(snapshot.currentModel.id),
+          chatModel: String(snapshot.currentModel.chatModel || snapshot.currentModel.id),
+          label: String(snapshot.currentModel.label || snapshot.currentModel.id),
+          uiMode: String(snapshot.currentModel.uiMode || 'unknown'),
+          enabled: false,
+        }
+      : judgeModel
+
+    state.activeRun = {
+      id: String(snapshot.runId || crypto.randomUUID()),
+      url: null,
+      headers: null,
+      originalBody: null,
+      originalQuestion: String(snapshot.originalQuestion || ''),
+      currentModel,
+      judgeModel,
+      fusionModelId: normalizeFusionModelId(
+        snapshot.fusionModelId || FUSION_MODEL_AUTO,
+        state.models,
+      ),
+      panelModels,
+      responses,
+      fusionRunning: false,
+      fusionRequested: !!snapshot.fusionRequested,
+      fusionPrompt: String(snapshot.fusionPrompt || ''),
+      pageKey: snapshot.pageKey,
+      restored: true,
+    }
+    state.activePanelId = responses.has(snapshot.activePanelId)
+      ? snapshot.activePanelId
+      : panelModels[0].id
+    return true
   }
 
   function getEnabledExtraModels() {
@@ -507,6 +702,64 @@
     }
   }
 
+  function resolveFusionModel(currentModel, selectedId = state.fusionModelId) {
+    if (selectedId === FUSION_MODEL_AUTO) return currentModel
+    return state.models.find((model) => model.id === selectedId) || currentModel
+  }
+
+  function getRunFusionModel(run) {
+    const selectedId = normalizeFusionModelId(
+      run?.fusionModelId || state.fusionModelId,
+      state.models,
+    )
+    if (run) run.fusionModelId = selectedId
+    return resolveFusionModel(run?.currentModel || run?.judgeModel, selectedId)
+  }
+
+  function populateFusionModelSelect(select, selectedId, currentModel = null) {
+    if (!select) return
+    const normalizedId = normalizeFusionModelId(selectedId, state.models)
+    select.replaceChildren()
+
+    const autoOption = document.createElement('option')
+    autoOption.value = FUSION_MODEL_AUTO
+    autoOption.textContent = currentModel
+      ? `Auto (${currentModel.label})`
+      : 'Auto (current Monica model)'
+    select.appendChild(autoOption)
+
+    for (const model of state.models) {
+      const option = document.createElement('option')
+      option.value = model.id
+      option.textContent = model.label
+      select.appendChild(option)
+    }
+    select.value = normalizedId
+  }
+
+  function syncFusionModelSelects() {
+    state.fusionModelId = normalizeFusionModelId(state.fusionModelId, state.models)
+    const run = state.activeRun
+    if (run) {
+      run.fusionModelId = normalizeFusionModelId(run.fusionModelId, state.models)
+      run.judgeModel = getRunFusionModel(run)
+    }
+
+    populateFusionModelSelect(
+      shadowRoot?.querySelector('#mm-fusion-model'),
+      state.fusionModelId,
+    )
+    populateFusionModelSelect(
+      state.panels.get(FUSION_MODEL_ID)?.modelSelect,
+      run?.fusionModelId || state.fusionModelId,
+      run?.currentModel || null,
+    )
+    const fusionPanel = state.panels.get(FUSION_MODEL_ID)
+    if (fusionPanel?.runButton && run && !run.restored) {
+      fusionPanel.runButton.title = `Run Fusion with ${run.judgeModel.label}`
+    }
+  }
+
   function createResponseRecord(model) {
     return {
       modelId: model.id,
@@ -621,9 +874,21 @@
 
   async function runFusion(run = state.activeRun) {
     if (!run || state.activeRun !== run || run.fusionRunning) return
-    const successful = getSuccessfulPanelResponses(run)
     const fusionPanel = getOrCreateFusionPanel()
-    selectPanel(FUSION_MODEL_ID)
+    if (run.restored || !run.originalBody || !run.url) {
+      fusionPanel.status.textContent = 'submit a new prompt to rerun'
+      return
+    }
+    const successful = getSuccessfulPanelResponses(run)
+    const fusionModel = getRunFusionModel(run)
+    run.judgeModel = fusionModel
+    if (fusionPanel.modelSelect) {
+      populateFusionModelSelect(
+        fusionPanel.modelSelect,
+        run.fusionModelId,
+        run.currentModel,
+      )
+    }
 
     if (successful.length < 2) {
       fusionPanel.status.textContent = `skipped: ${successful.length}/2 usable answers`
@@ -632,11 +897,13 @@
     }
 
     run.fusionRunning = true
+    if (fusionPanel.runButton) fusionPanel.runButton.disabled = true
+    if (fusionPanel.modelSelect) fusionPanel.modelSelect.disabled = true
     run.fusionRequested = true
     const fusionResponse = createResponseRecord({
       id: FUSION_MODEL_ID,
-      label: `Fusion · ${run.judgeModel.label}`,
-      uiMode: run.judgeModel.uiMode,
+      label: `Fusion · ${fusionModel.label}`,
+      uiMode: fusionModel.uiMode,
     })
     fusionResponse.status = 'streaming'
     fusionResponse.startedAt = Date.now()
@@ -646,9 +913,10 @@
     try {
       const prompt = buildFusionPrompt(run.originalQuestion, successful)
       run.fusionPrompt = prompt
+      saveRunSnapshotNow()
       if (fusionPanel.copyButton) fusionPanel.copyButton.disabled = false
-      const fusionBody = buildFusionBody(run.originalBody, run.judgeModel, prompt)
-      replayRequest(run, fusionBody, run.judgeModel, FUSION_MODEL_ID, 'fusion')
+      const fusionBody = buildFusionBody(run.originalBody, fusionModel, prompt)
+      replayRequest(run, fusionBody, fusionModel, FUSION_MODEL_ID, 'fusion')
       await waitForRunResponses(run, [FUSION_MODEL_ID])
     } catch (error) {
       fusionResponse.status = 'error'
@@ -657,6 +925,9 @@
       updateFusionPanel(fusionResponse)
     } finally {
       run.fusionRunning = false
+      if (fusionPanel.runButton) fusionPanel.runButton.disabled = false
+      if (fusionPanel.modelSelect) fusionPanel.modelSelect.disabled = false
+      saveRunSnapshotNow()
     }
   }
 
@@ -664,21 +935,28 @@
     const panelModels = getEnabledExtraModels()
     if (panelModels.length === 0) return
 
-    const judgeModel = getCurrentModel(originalBody)
+    const currentModel = getCurrentModel(originalBody)
+    const fusionModelId = normalizeFusionModelId(state.fusionModelId, state.models)
+    const judgeModel = resolveFusionModel(currentModel, fusionModelId)
     const run = {
       id: runId || crypto.randomUUID(),
       url,
       headers: originalHeaders,
       originalBody,
       originalQuestion: getOriginalQuestion(originalBody),
+      currentModel,
       judgeModel,
+      fusionModelId,
       panelModels,
       responses: new Map(panelModels.map((model) => [model.id, createResponseRecord(model)])),
       fusionRunning: false,
       fusionRequested: false,
       fusionPrompt: '',
+      pageKey: getRunPageKey(),
+      restored: false,
     }
     state.activeRun = run
+    saveRunSnapshotNow()
 
     clearPanels()
     ensurePanelsContainer()
@@ -687,8 +965,8 @@
     }
     if (state.fusionEnabled) getOrCreateFusionPanel()
 
-    const replayModels = panelModels.filter((model) => model.id !== judgeModel.id)
-    const currentPanelResponse = run.responses.get(judgeModel.id)
+    const replayModels = panelModels.filter((model) => model.id !== currentModel.id)
+    const currentPanelResponse = run.responses.get(currentModel.id)
     if (currentPanelResponse) {
       currentPanelResponse.status = 'streaming'
       currentPanelResponse.startedAt = Date.now()
@@ -736,6 +1014,7 @@
     if (state.autoReload) {
       console.log(`[${SCRIPT_ID}] Auto-reload is enabled, but skipped for Fusion runs so the result remains visible.`)
     }
+    saveRunSnapshotNow()
   }
 
 
@@ -764,6 +1043,7 @@
       tabs = document.createElement('div')
       tabs.className = 'mm-panel-tabs'
       tabs.setAttribute('role', 'tablist')
+      tabs.setAttribute('aria-orientation', 'vertical')
       const panels = ensurePanelsContainer()
       mainContainer.insertBefore(tabs, panels)
     }
@@ -788,6 +1068,7 @@
     const activePanel = state.panels.get(modelId)
     const activeResponse = state.activeRun?.responses.get(modelId)
     if (activePanel && activeResponse) activePanel.content.scrollTop = activeResponse.scrollTop || 0
+    scheduleRunSnapshotSave()
   }
 
   function getPanelDomId(modelId) {
@@ -810,14 +1091,14 @@
     button.title = `Show ${label} result`
     button.addEventListener('click', () => selectPanel(modelId))
     button.addEventListener('keydown', (event) => {
-      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
       const buttons = [...tabs.querySelectorAll('.mm-panel-tab')]
       const currentIndex = buttons.indexOf(button)
       const nextIndex = event.key === 'Home'
         ? 0
         : event.key === 'End'
           ? buttons.length - 1
-          : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + buttons.length) % buttons.length
+          : (currentIndex + (['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1) + buttons.length) % buttons.length
       const nextButton = buttons[nextIndex]
       if (!nextButton) return
       event.preventDefault()
@@ -900,11 +1181,40 @@
     status.className = 'mm-panel-status'
     status.textContent = 'collecting...'
 
+    const modelSelect = document.createElement('select')
+    modelSelect.className = 'mm-input mm-fusion-model-select'
+    modelSelect.setAttribute('aria-label', 'Fusion model')
+    modelSelect.title = 'Choose the model used to synthesize the Fusion answer'
+    populateFusionModelSelect(
+      modelSelect,
+      state.activeRun?.fusionModelId || state.fusionModelId,
+      state.activeRun?.currentModel || null,
+    )
+
     const runButton = document.createElement('button')
     runButton.className = 'mm-icon-btn'
     runButton.textContent = 'Run'
-    runButton.title = 'Run Fusion with the current Monica model'
+    runButton.disabled = !!state.activeRun?.restored
+    runButton.title = state.activeRun?.restored
+      ? 'Submit a new prompt before rerunning Fusion'
+      : `Run Fusion with ${
+          state.activeRun
+            ? getRunFusionModel(state.activeRun).label
+            : 'the selected model'
+        }`
     runButton.addEventListener('click', () => runFusion())
+    modelSelect.addEventListener('change', () => {
+      const selectedId = normalizeFusionModelId(modelSelect.value, state.models)
+      state.fusionModelId = selectedId
+      persistState()
+      const run = state.activeRun
+      if (run) {
+        run.fusionModelId = selectedId
+        run.judgeModel = getRunFusionModel(run)
+        runButton.title = `Run Fusion with ${run.judgeModel.label}`
+        scheduleRunSnapshotSave()
+      }
+    })
 
     const copyButton = document.createElement('button')
     copyButton.className = 'mm-icon-btn'
@@ -924,6 +1234,7 @@
     })
 
     actions.appendChild(status)
+    actions.appendChild(modelSelect)
     actions.appendChild(runButton)
     actions.appendChild(copyButton)
     header.appendChild(label)
@@ -938,7 +1249,16 @@
     container.appendChild(panel)
 
     const tabButton = createPanelTab(FUSION_MODEL_ID, 'Fusion', true)
-    const panelRef = { container: panel, content, status, label, runButton, copyButton, tabButton }
+    const panelRef = {
+      container: panel,
+      content,
+      status,
+      label,
+      modelSelect,
+      runButton,
+      copyButton,
+      tabButton,
+    }
     state.panels.set(FUSION_MODEL_ID, panelRef)
     if (!state.activePanelId || state.activePanelId === FUSION_MODEL_ID) selectPanel(FUSION_MODEL_ID)
     return panelRef
@@ -970,6 +1290,158 @@
     }
     markdownEngine = { parser, purifier }
     return markdownEngine
+  }
+
+  function isEscaped(source, index) {
+    let slashCount = 0
+    for (let cursor = index - 1; cursor >= 0 && source[cursor] === '\\'; cursor -= 1) {
+      slashCount += 1
+    }
+    return slashCount % 2 === 1
+  }
+
+  function findMathDelimiterEnd(source, start, delimiter) {
+    let cursor = start
+    while (cursor < source.length) {
+      const index = source.indexOf(delimiter, cursor)
+      if (index < 0) return -1
+      if (delimiter === '$' && source.slice(start, index).includes('\n')) return -1
+      const expression = source.slice(start, index)
+      const validSingleDollarEnd = delimiter !== '$' || !/\s/.test(source[index - 1] || '')
+      if (!isEscaped(source, index) && expression.trim() && validSingleDollarEnd) return index
+      cursor = index + delimiter.length
+    }
+    return -1
+  }
+
+  function extractMathExpressions(markdown) {
+    const source = String(markdown || '')
+    const expressions = []
+    const tokenPrefix = `MMMATHTOKEN${Date.now()}${Math.random().toString(36).slice(2)}`
+    let output = ''
+    let cursor = 0
+    let fence = null
+    let inlineTicks = 0
+
+    while (cursor < source.length) {
+      const atLineStart = cursor === 0 || source[cursor - 1] === '\n'
+      if (atLineStart) {
+        const lineEnd = source.indexOf('\n', cursor)
+        const end = lineEnd < 0 ? source.length : lineEnd + 1
+        const line = source.slice(cursor, end)
+        const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/)
+        if (fenceMatch) {
+          const marker = fenceMatch[1]
+          if (!fence) {
+            fence = { char: marker[0], length: marker.length }
+          } else if (fence.char === marker[0] && marker.length >= fence.length) {
+            fence = null
+          }
+          output += line
+          cursor = end
+          continue
+        }
+      }
+
+      if (fence) {
+        output += source[cursor]
+        cursor += 1
+        continue
+      }
+
+      if (source[cursor] === '`' && !isEscaped(source, cursor)) {
+        let tickCount = 1
+        while (source[cursor + tickCount] === '`') tickCount += 1
+        inlineTicks = inlineTicks === tickCount ? 0 : inlineTicks || tickCount
+        output += source.slice(cursor, cursor + tickCount)
+        cursor += tickCount
+        continue
+      }
+
+      if (!inlineTicks && source.startsWith('$$', cursor) && !isEscaped(source, cursor)) {
+        const end = findMathDelimiterEnd(source, cursor + 2, '$$')
+        if (end >= 0) {
+          const lineStart = source.lastIndexOf('\n', cursor - 1) + 1
+          const nextLineBreak = source.indexOf('\n', end + 2)
+          const lineEnd = nextLineBreak < 0 ? source.length : nextLineBreak
+          const display = !source.slice(lineStart, cursor).trim()
+            && !source.slice(end + 2, lineEnd).trim()
+          const raw = source.slice(cursor, end + 2)
+          const token = `${tokenPrefix}${expressions.length}END`
+          expressions.push({ tex: source.slice(cursor + 2, end).trim(), display, raw })
+          output += token
+          cursor = end + 2
+          continue
+        }
+      }
+
+      if (
+        !inlineTicks
+        && source[cursor] === '$'
+        && source[cursor + 1] !== '$'
+        && !isEscaped(source, cursor)
+        && source[cursor + 1]
+        && !/\s/.test(source[cursor + 1])
+      ) {
+        const end = findMathDelimiterEnd(source, cursor + 1, '$')
+        if (end >= 0 && source[end + 1] !== '$') {
+          const raw = source.slice(cursor, end + 1)
+          const token = `${tokenPrefix}${expressions.length}END`
+          expressions.push({ tex: source.slice(cursor + 1, end).trim(), display: false, raw })
+          output += token
+          cursor = end + 1
+          continue
+        }
+      }
+
+      output += source[cursor]
+      cursor += 1
+    }
+
+    return { source: output, expressions, tokenPrefix }
+  }
+
+  function hydrateMathExpressions(container, math) {
+    if (!math.expressions.length) return
+    const pattern = new RegExp(`${math.tokenPrefix}(\\d+)END`, 'g')
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
+    const textNodes = []
+    while (walker.nextNode()) textNodes.push(walker.currentNode)
+
+    for (const textNode of textNodes) {
+      const text = textNode.textContent || ''
+      pattern.lastIndex = 0
+      if (!pattern.test(text)) continue
+      pattern.lastIndex = 0
+      const fragment = document.createDocumentFragment()
+      let previousIndex = 0
+      let match
+
+      while ((match = pattern.exec(text))) {
+        fragment.appendChild(document.createTextNode(text.slice(previousIndex, match.index)))
+        const expression = math.expressions[Number(match[1])]
+        const wrapper = document.createElement('span')
+        wrapper.className = expression.display ? 'mm-math mm-math-display' : 'mm-math mm-math-inline'
+        try {
+          if (typeof globalThis.katex?.render !== 'function') throw new Error('KaTeX unavailable')
+          globalThis.katex.render(expression.tex, wrapper, {
+            displayMode: expression.display,
+            output: 'mathml',
+            throwOnError: false,
+            strict: 'ignore',
+            trust: false,
+          })
+        } catch {
+          wrapper.classList.add('mm-math-fallback')
+          wrapper.textContent = expression.raw
+        }
+        fragment.appendChild(wrapper)
+        previousIndex = match.index + match[0].length
+      }
+
+      fragment.appendChild(document.createTextNode(text.slice(previousIndex)))
+      textNode.replaceWith(fragment)
+    }
   }
 
   function appendInlineMarkdown(parent, text) {
@@ -1084,11 +1556,12 @@
     const keepPinnedToBottom = distanceFromBottom < 36
     const previousScrollTop = container.scrollTop
     const source = String(markdown || '').replace(/^[\u200B-\u200F\uFEFF]/, '')
+    const math = extractMathExpressions(source)
     const engine = getMarkdownEngine()
 
     if (engine) {
       try {
-        const html = engine.parser.render(source)
+        const html = engine.parser.render(math.source)
         const fragment = engine.purifier.sanitize(html, {
           RETURN_DOM_FRAGMENT: true,
           ALLOWED_TAGS: [
@@ -1102,12 +1575,15 @@
         })
         container.replaceChildren(fragment)
         decorateRenderedMarkdown(container)
+        hydrateMathExpressions(container, math)
       } catch (error) {
         console.warn(`[${SCRIPT_ID}] Markdown renderer fallback:`, error)
-        renderMarkdownFallback(container, source)
+        renderMarkdownFallback(container, math.source)
+        hydrateMathExpressions(container, math)
       }
     } else {
-      renderMarkdownFallback(container, source)
+      renderMarkdownFallback(container, math.source)
+      hydrateMathExpressions(container, math)
     }
 
     if (keepPinnedToBottom) container.scrollTop = container.scrollHeight
@@ -1146,6 +1622,14 @@
         : response.status
     updatePanelTab(panel, tabStatus)
     renderMarkdown(panel.content, response.finalText, response.status !== 'streaming')
+    if (response.status !== 'streaming') {
+      requestAnimationFrame(() => {
+        if (state.activeRun?.responses.get(response.modelId) === response) {
+          panel.content.scrollTop = response.scrollTop || 0
+        }
+      })
+    }
+    scheduleRunSnapshotSave()
   }
 
   function updateFusionPanel(response) {
@@ -1163,6 +1647,14 @@
       response.finalText || (response.error ? 'Fusion failed. Use Run to retry.' : 'Synthesizing the model responses...'),
       response.status !== 'streaming'
     )
+    if (response.status !== 'streaming') {
+      requestAnimationFrame(() => {
+        if (state.activeRun?.responses.get(FUSION_MODEL_ID) === response) {
+          panel.content.scrollTop = response.scrollTop || 0
+        }
+      })
+    }
+    scheduleRunSnapshotSave()
   }
 
   function clearPanels() {
@@ -1218,6 +1710,7 @@
   let uiObserver = null
   let uiRepairTimer = null
   let uiRepairInterval = null
+  let viewportListenerInstalled = false
 
   function isConnected(node) {
     return !!node && node.isConnected
@@ -1238,17 +1731,24 @@
     resetPanelRefsIfDetached()
 
     if (isConnected(shadowHost) && isConnected(mainContainer)) {
-      mainContainer.style.display = 'flex'
+      mainContainer.style.display = 'grid'
       state.panelVisible = true
+      requestAnimationFrame(() => constrainPanelToViewport(true))
       return shadowHost
     }
 
     shadowHost = document.createElement('div')
     shadowHost.id = `${SCRIPT_ID}-host`
-    shadowHost.style.cssText = 'position:fixed;top:0;right:0;bottom:0;z-index:999999;pointer-events:none;'
+    shadowHost.style.cssText = 'position:fixed;inset:0;z-index:999999;pointer-events:none;'
     document.body.appendChild(shadowHost)
 
     shadowRoot = shadowHost.attachShadow({ mode: 'open' })
+    shadowRoot.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !state.panelVisible) return
+      mainContainer.style.display = 'none'
+      state.panelVisible = false
+      document.getElementById(`${SCRIPT_ID}-toggle`)?.focus()
+    })
 
     const style = document.createElement('style')
     style.textContent = getStyles()
@@ -1256,7 +1756,9 @@
 
     mainContainer = document.createElement('div')
     mainContainer.className = 'mm-main'
+    mainContainer.style.setProperty('--mm-opacity', String(state.panelOpacity / 100))
     shadowRoot.appendChild(mainContainer)
+    restorePanelPosition()
 
     // Header bar
     const header = document.createElement('div')
@@ -1300,15 +1802,35 @@
         const response = state.activeRun.responses.get(model.id)
         if (response) updateModelPanel(response)
       }
-      if (state.fusionEnabled) {
-        const fusionResponse = state.activeRun.responses.get(FUSION_MODEL_ID)
+      const fusionResponse = state.activeRun.responses.get(FUSION_MODEL_ID)
+      if (state.fusionEnabled || fusionResponse) {
         if (fusionResponse) updateFusionPanel(fusionResponse)
         else getOrCreateFusionPanel()
       }
     }
 
+    const resizeLabels = {
+      n: '拖动上边缘调整高度',
+      e: '拖动右边缘调整宽度',
+      s: '拖动下边缘调整高度',
+      w: '拖动左边缘调整宽度',
+      ne: '拖动右上角调整大小',
+      se: '拖动右下角调整大小',
+      sw: '拖动左下角调整大小',
+      nw: '拖动左上角调整大小',
+    }
+    for (const [direction, label] of Object.entries(resizeLabels)) {
+      const handle = document.createElement('div')
+      handle.className = `mm-resize-handle mm-resize-${direction}`
+      handle.dataset.direction = direction
+      handle.title = label
+      handle.setAttribute('aria-label', label)
+      mainContainer.appendChild(handle)
+    }
+
     state.panelVisible = true
     enableDrag()
+    enableResize()
     return shadowHost
   }
 
@@ -1327,6 +1849,33 @@
     heading.className = 'mm-settings-heading'
     heading.textContent = 'Settings'
     panel.appendChild(heading)
+
+    const opacityGroup = document.createElement('div')
+    opacityGroup.className = 'mm-setting-group'
+
+    const opacityLabel = document.createElement('label')
+    opacityLabel.className = 'mm-label mm-opacity-label'
+    opacityLabel.htmlFor = 'mm-panel-opacity'
+    opacityLabel.textContent = `Panel opacity: ${state.panelOpacity}%`
+
+    const opacityInput = document.createElement('input')
+    opacityInput.id = 'mm-panel-opacity'
+    opacityInput.className = 'mm-range'
+    opacityInput.type = 'range'
+    opacityInput.min = '20'
+    opacityInput.max = '75'
+    opacityInput.step = '1'
+    opacityInput.value = String(state.panelOpacity)
+    opacityInput.addEventListener('input', (event) => {
+      state.panelOpacity = clamp(Number(event.target.value), 20, 75)
+      opacityLabel.textContent = `Panel opacity: ${state.panelOpacity}%`
+      mainContainer?.style.setProperty('--mm-opacity', String(state.panelOpacity / 100))
+      persistState()
+    })
+
+    opacityGroup.appendChild(opacityLabel)
+    opacityGroup.appendChild(opacityInput)
+    panel.appendChild(opacityGroup)
 
     // Endpoint pattern
     const endpointGroup = document.createElement('div')
@@ -1417,6 +1966,29 @@
     fusionAutoRow.appendChild(fusionAutoCheckbox)
     fusionAutoRow.appendChild(fusionAutoLabel)
     fusionGroup.appendChild(fusionAutoRow)
+
+    const fusionModelLabel = document.createElement('label')
+    fusionModelLabel.htmlFor = 'mm-fusion-model'
+    fusionModelLabel.textContent = 'Fusion model:'
+    fusionModelLabel.className = 'mm-label'
+
+    const fusionModelSelect = document.createElement('select')
+    fusionModelSelect.id = 'mm-fusion-model'
+    fusionModelSelect.className = 'mm-input'
+    populateFusionModelSelect(fusionModelSelect, state.fusionModelId)
+    fusionModelSelect.addEventListener('change', () => {
+      state.fusionModelId = normalizeFusionModelId(fusionModelSelect.value, state.models)
+      if (state.activeRun) {
+        state.activeRun.fusionModelId = state.fusionModelId
+        state.activeRun.judgeModel = getRunFusionModel(state.activeRun)
+      }
+      persistState()
+      syncFusionModelSelects()
+      scheduleRunSnapshotSave()
+    })
+
+    fusionGroup.appendChild(fusionModelLabel)
+    fusionGroup.appendChild(fusionModelSelect)
     panel.appendChild(fusionGroup)
 
     // Auto-reload checkbox
@@ -1513,6 +2085,7 @@
       persistState()
       // Rebuild settings panel
       rebuildSettingsModels(modelsList)
+      syncFusionModelSelects()
       customInput.value = ''
     })
 
@@ -1567,8 +2140,10 @@
       removeBtn.className = 'mm-btn-remove'
       removeBtn.addEventListener('click', () => {
         state.models = state.models.filter((_, i) => i !== index)
+        state.fusionModelId = normalizeFusionModelId(state.fusionModelId, state.models)
         persistState()
         rebuildSettingsModels(modelsList)
+        syncFusionModelSelects()
       })
 
       row.appendChild(checkbox)
@@ -1595,90 +2170,173 @@
       * { box-sizing: border-box; margin: 0; padding: 0; }
 
       .mm-main {
+        --mm-opacity: 0.42;
         position: fixed;
         top: 60px;
         right: 12px;
-        width: min(480px, calc(100vw - 24px));
-        min-width: min(340px, calc(100vw - 24px));
-        height: min(760px, calc(100vh - 80px));
-        background: #1e1e2e;
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        border-radius: 12px;
-        display: flex;
-        flex-direction: column;
+        width: min(428px, calc(100vw - 16px));
+        min-width: min(360px, calc(100vw - 16px));
+        max-width: 100vw;
+        height: min(260px, calc(100vh - 16px));
+        min-height: min(216px, calc(100vh - 16px));
+        max-height: 100vh;
+        grid-template-columns: minmax(0, 1fr) 94px;
+        grid-template-rows: 38px minmax(0, 1fr);
+        grid-template-areas:
+          "header header"
+          "content rail";
+        background: rgba(10, 12, 18, calc(var(--mm-opacity) * 0.16));
+        color: rgba(245, 247, 255, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.44);
+        border-radius: 7px;
+        display: grid;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         font-size: 13px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+        backdrop-filter: blur(3px) saturate(108%);
         pointer-events: auto;
         overflow: hidden;
-        resize: horizontal;
+      }
+
+      .mm-resize-handle {
+        position: absolute;
+        z-index: 30;
+        touch-action: none;
+        background: transparent;
+        transition: background 0.12s;
+      }
+      .mm-resize-handle:hover,
+      .mm-resize-handle:active {
+        background: rgba(125, 211, 252, 0.28);
+      }
+      .mm-resize-n,
+      .mm-resize-s {
+        left: 16px;
+        right: 16px;
+        height: 9px;
+      }
+      .mm-resize-n { top: 0; cursor: n-resize; }
+      .mm-resize-s { bottom: 0; cursor: s-resize; }
+      .mm-resize-e,
+      .mm-resize-w {
+        top: 16px;
+        bottom: 16px;
+        width: 9px;
+      }
+      .mm-resize-e { right: 0; cursor: e-resize; }
+      .mm-resize-w { left: 0; cursor: w-resize; }
+      .mm-resize-ne,
+      .mm-resize-se,
+      .mm-resize-sw,
+      .mm-resize-nw {
+        width: 16px;
+        height: 16px;
+      }
+      .mm-resize-ne { top: 0; right: 0; cursor: ne-resize; }
+      .mm-resize-se { right: 0; bottom: 0; cursor: se-resize; }
+      .mm-resize-sw { bottom: 0; left: 0; cursor: sw-resize; }
+      .mm-resize-nw { top: 0; left: 0; cursor: nw-resize; }
+      .mm-resize-se::after {
+        content: '';
+        position: absolute;
+        right: 3px;
+        bottom: 3px;
+        width: 7px;
+        height: 7px;
+        border-right: 2px solid rgba(186, 230, 253, 0.78);
+        border-bottom: 2px solid rgba(186, 230, 253, 0.78);
+        border-radius: 0 0 2px 0;
+        pointer-events: none;
       }
 
       .mm-header {
+        grid-area: header;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 10px 14px;
-        background: #181825;
-        border-bottom: 1px solid #45475a;
-        cursor: move;
+        min-width: 0;
+        padding: 5px 7px 5px 10px;
+        background: rgba(16, 18, 26, calc(var(--mm-opacity) * 0.86));
+        border-bottom: 1px solid rgba(148, 163, 184, 0.32);
+        cursor: grab;
+        touch-action: none;
       }
+      .mm-header:active { cursor: grabbing; }
 
       .mm-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
         font-weight: 600;
-        font-size: 14px;
-        color: #cba6f7;
+        font-size: 12px;
+        color: rgba(232, 221, 255, 0.98);
       }
 
       .mm-btn-group {
         display: flex;
-        gap: 6px;
+        flex: 0 0 auto;
+        gap: 4px;
       }
 
       .mm-btn {
-        background: #313244;
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        border-radius: 6px;
-        padding: 4px 10px;
+        min-width: 28px;
+        height: 27px;
+        background: rgba(58, 63, 78, calc(var(--mm-opacity) * 0.72));
+        color: rgba(245, 247, 255, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.36);
+        border-radius: 5px;
+        padding: 3px 7px;
         cursor: pointer;
-        font-size: 13px;
+        font-size: 12px;
         transition: background 0.15s;
       }
-      .mm-btn:hover { background: #45475a; }
+      .mm-btn:hover { background: rgba(74, 82, 102, min(0.65, calc(var(--mm-opacity) + 0.16))); }
+      .mm-btn:focus-visible,
+      .mm-icon-btn:focus-visible,
+      .mm-panel-tab:focus-visible,
+      .mm-input:focus-visible,
+      .mm-range:focus-visible {
+        outline: 2px solid rgba(125, 211, 252, 0.92);
+        outline-offset: 1px;
+      }
 
       .mm-btn-add {
         font-weight: bold;
-        font-size: 16px;
-        padding: 4px 12px;
+        font-size: 15px;
       }
 
       .mm-btn-remove {
-        background: none;
+        background: rgba(70, 20, 30, calc(var(--mm-opacity) * 0.35));
         border: none;
-        color: #f38ba8;
+        color: rgba(253, 164, 175, 0.98);
         cursor: pointer;
         font-size: 16px;
         padding: 0 4px;
         margin-left: auto;
       }
-      .mm-btn-remove:hover { color: #eba0ac; }
+      .mm-btn-remove:hover { color: rgba(255, 205, 211, 1); }
 
       .mm-settings {
-        padding: 10px 14px;
-        border-bottom: 1px solid #45475a;
-        background: #1e1e2e;
-        max-height: 350px;
+        position: absolute;
+        z-index: 10;
+        top: 38px;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        padding: 9px 11px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.32);
+        background: rgba(18, 20, 29, var(--mm-opacity));
         overflow-y: auto;
+        backdrop-filter: blur(4px) saturate(110%);
       }
 
       .mm-settings-heading {
         font-weight: 600;
         font-size: 12px;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
-        color: #a6adc8;
+        letter-spacing: 0;
+        color: rgba(218, 224, 240, 0.92);
         margin-bottom: 6px;
       }
 
@@ -1689,21 +2347,27 @@
       .mm-label {
         display: block;
         font-size: 12px;
-        color: #a6adc8;
+        color: rgba(218, 224, 240, 0.92);
         margin-bottom: 3px;
       }
 
       .mm-input {
         width: 100%;
-        background: #313244;
-        color: #cdd6f4;
-        border: 1px solid #45475a;
-        border-radius: 6px;
+        background: rgba(44, 49, 63, calc(var(--mm-opacity) * 0.9));
+        color: rgba(245, 247, 255, 0.98);
+        border: 1px solid rgba(148, 163, 184, 0.36);
+        border-radius: 5px;
         padding: 5px 8px;
         font-size: 13px;
         outline: none;
       }
-      .mm-input:focus { border-color: #cba6f7; }
+      .mm-input:focus { border-color: rgba(196, 181, 253, 0.92); }
+
+      .mm-range {
+        width: 100%;
+        accent-color: rgba(125, 211, 252, 0.96);
+        cursor: pointer;
+      }
 
       .mm-models-list {
         display: flex;
@@ -1725,94 +2389,96 @@
       }
 
       .mm-panel-tabs {
+        grid-area: rail;
         display: flex;
-        flex: 0 0 auto;
-        gap: 2px;
-        padding: 6px 8px 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-        background: #181825;
-        border-bottom: 1px solid #45475a;
+        flex-direction: column;
+        gap: 1px;
+        min-width: 0;
+        padding: 5px;
+        overflow-x: hidden;
+        overflow-y: auto;
+        background: rgba(16, 18, 26, calc(var(--mm-opacity) * 0.72));
+        border-left: 1px solid rgba(148, 163, 184, 0.32);
         scrollbar-width: thin;
       }
 
       .mm-panel-tab {
         position: relative;
-        flex: 0 0 auto;
-        min-width: 76px;
-        height: 32px;
-        padding: 0 10px 0 22px;
+        flex: 0 0 39px;
+        width: 100%;
+        min-width: 0;
+        padding: 3px 5px 3px 18px;
         border: 0;
-        border-bottom: 2px solid transparent;
-        background: transparent;
-        color: #a6adc8;
+        border-left: 2px solid rgba(0, 0, 0, 0.01);
+        border-radius: 4px;
+        background: rgba(35, 39, 51, calc(var(--mm-opacity) * 0.34));
+        color: rgba(206, 214, 235, 0.9);
         cursor: pointer;
-        font-size: 12px;
+        font-size: 10px;
         text-align: left;
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       .mm-panel-tab::before {
         content: '';
         position: absolute;
-        left: 9px;
+        left: 6px;
         top: 50%;
-        width: 7px;
-        height: 7px;
+        width: 6px;
+        height: 6px;
         border-radius: 50%;
-        background: #6c7086;
+        background: rgba(148, 163, 184, 0.78);
         transform: translateY(-50%);
       }
 
       .mm-panel-tab[data-status="streaming"]::before,
       .mm-panel-tab[data-status="thinking"]::before {
-        background: #f9e2af;
+        background: rgba(253, 224, 128, 0.96);
         box-shadow: 0 0 0 3px rgba(249, 226, 175, 0.12);
       }
 
       .mm-panel-tab[data-status="done"]::before {
-        background: #a6e3a1;
+        background: rgba(134, 239, 172, 0.96);
       }
 
       .mm-panel-tab[data-status="error"]::before {
-        background: #f38ba8;
+        background: rgba(253, 164, 175, 0.98);
       }
 
       .mm-panel-tab:hover {
-        color: #cdd6f4;
-        background: #252536;
+        color: rgba(255, 255, 255, 1);
+        background: rgba(60, 68, 87, min(0.65, calc(var(--mm-opacity) + 0.16)));
       }
 
       .mm-panel-tab.is-active {
-        color: #f5e0dc;
-        border-bottom-color: #89b4fa;
-        background: #1e1e2e;
+        color: rgba(255, 255, 255, 1);
+        border-left-color: rgba(125, 211, 252, 0.96);
+        background: rgba(48, 55, 72, calc(var(--mm-opacity) * 0.9));
       }
 
       .mm-fusion-tab {
-        position: sticky;
-        left: 0;
-        z-index: 2;
-        color: #a6e3a1;
+        color: rgba(167, 243, 208, 0.98);
         font-weight: 600;
-        background: #181825;
+        background: rgba(20, 62, 48, calc(var(--mm-opacity) * 0.42));
       }
 
       .mm-fusion-tab.is-active {
-        border-bottom-color: #a6e3a1;
+        border-left-color: rgba(110, 231, 183, 0.96);
       }
 
       .mm-panels {
-        flex: 1;
+        grid-area: content;
         min-height: 0;
         overflow: hidden;
-        background: #11111b;
+        background: rgba(9, 11, 17, calc(var(--mm-opacity) * 0.14));
       }
 
       .mm-panel {
         height: 100%;
         min-height: 0;
-        background: #1e1e2e;
+        background: rgba(18, 20, 29, calc(var(--mm-opacity) * 0.14));
         display: none;
         flex-direction: column;
       }
@@ -1825,50 +2491,65 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
-        padding: 6px 14px;
-        background: #181825;
-        border-bottom: 1px solid #313244;
+        min-height: 30px;
+        padding: 4px 9px;
+        background: rgba(20, 23, 33, calc(var(--mm-opacity) * 0.76));
+        border-bottom: 1px solid rgba(148, 163, 184, 0.26);
       }
 
       .mm-panel-label {
         font-weight: 600;
-        font-size: 13px;
-        color: #89b4fa;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        color: rgba(147, 197, 253, 0.98);
       }
 
       .mm-panel-status {
         font-size: 11px;
-        color: #a6adc8;
+        color: rgba(218, 224, 240, 0.9);
       }
 
       .mm-fusion-panel {
-        border-top: 1px solid #313244;
+        border-top: 1px solid rgba(110, 231, 183, 0.34);
       }
 
       .mm-fusion-label {
-        color: #a6e3a1;
+        color: rgba(167, 243, 208, 0.98);
       }
 
       .mm-fusion-actions {
         display: flex;
         align-items: center;
-        gap: 6px;
+        min-width: 0;
+        gap: 4px;
+      }
+
+      .mm-fusion-model-select {
+        width: 106px;
+        min-width: 78px;
+        height: 24px;
+        padding: 2px 5px;
+        font-size: 11px;
+        text-overflow: ellipsis;
       }
 
       .mm-icon-btn {
         min-width: 38px;
         height: 24px;
         padding: 0 7px;
-        border: 1px solid #45475a;
+        border: 1px solid rgba(148, 163, 184, 0.36);
         border-radius: 4px;
-        background: #313244;
-        color: #cdd6f4;
+        background: rgba(54, 61, 78, calc(var(--mm-opacity) * 0.76));
+        color: rgba(245, 247, 255, 0.96);
         cursor: pointer;
         font-size: 11px;
       }
 
       .mm-icon-btn:hover {
-        background: #45475a;
+        background: rgba(74, 82, 102, min(0.65, calc(var(--mm-opacity) + 0.16)));
       }
 
       .mm-icon-btn:disabled {
@@ -1877,30 +2558,32 @@
       }
 
       .mm-icon-btn:disabled:hover {
-        background: #313244;
+        background: rgba(54, 61, 78, calc(var(--mm-opacity) * 0.76));
       }
 
       .mm-panel-content {
         flex: 1;
         min-height: 0;
-        padding: 10px 14px;
+        padding: 9px 11px 14px;
         overflow-y: auto;
         overflow-x: hidden;
-        line-height: 1.6;
+        background: rgba(17, 20, 28, var(--mm-opacity));
+        line-height: 1.55;
         white-space: normal;
         overflow-wrap: anywhere;
+        scrollbar-gutter: stable;
       }
 
-      .mm-panel-content h1 { font-size: 19px; margin: 14px 0 7px; color: #f5e0dc; line-height: 1.35; }
-      .mm-panel-content h2 { font-size: 17px; margin: 13px 0 6px; color: #cba6f7; line-height: 1.4; }
-      .mm-panel-content h3 { font-size: 15px; margin: 11px 0 5px; color: #89b4fa; line-height: 1.4; }
-      .mm-panel-content h4 { font-size: 14px; margin: 9px 0 4px; color: #a6adc8; line-height: 1.4; }
+      .mm-panel-content h1 { font-size: 17px; margin: 12px 0 6px; color: rgba(255, 241, 242, 0.98); line-height: 1.35; }
+      .mm-panel-content h2 { font-size: 15px; margin: 11px 0 5px; color: rgba(221, 214, 254, 0.98); line-height: 1.4; }
+      .mm-panel-content h3 { font-size: 14px; margin: 10px 0 4px; color: rgba(147, 197, 253, 0.98); line-height: 1.4; }
+      .mm-panel-content h4 { font-size: 13px; margin: 8px 0 4px; color: rgba(218, 224, 240, 0.92); line-height: 1.4; }
 
       .mm-panel-content > :first-child { margin-top: 0; }
       .mm-panel-content > :last-child { margin-bottom: 0; }
 
       .mm-panel-content code {
-        background: #313244;
+        background: rgba(48, 53, 68, calc(var(--mm-opacity) * 0.82));
         padding: 1px 5px;
         border-radius: 4px;
         font-family: 'Cascadia Code', 'Fira Code', monospace;
@@ -1909,7 +2592,7 @@
 
       .mm-panel-content pre {
         position: relative;
-        background: #11111b;
+        background: rgba(8, 10, 16, var(--mm-opacity));
         padding: 12px 44px 12px 12px;
         border-radius: 6px;
         overflow-x: auto;
@@ -1918,7 +2601,7 @@
       }
 
       .mm-panel-content pre code {
-        background: none;
+        background: rgba(18, 20, 29, calc(var(--mm-opacity) * 0.22));
         padding: 0;
       }
 
@@ -1928,21 +2611,50 @@
         right: 6px;
         height: 24px;
         padding: 0 7px;
-        border: 1px solid #45475a;
+        border: 1px solid rgba(148, 163, 184, 0.34);
         border-radius: 4px;
-        background: #252536;
-        color: #a6adc8;
+        background: rgba(48, 53, 68, calc(var(--mm-opacity) * 0.82));
+        color: rgba(218, 224, 240, 0.92);
         cursor: pointer;
         font-size: 11px;
       }
 
       .mm-code-copy:hover {
-        color: #f5e0dc;
-        background: #313244;
+        color: rgba(255, 255, 255, 1);
+        background: rgba(74, 82, 102, min(0.65, calc(var(--mm-opacity) + 0.16)));
       }
 
-      .mm-panel-content strong { color: #f5e0dc; }
-      .mm-panel-content em { color: #f2cdcd; }
+      .mm-panel-content strong { color: rgba(255, 241, 242, 0.98); }
+      .mm-panel-content em { color: rgba(254, 205, 211, 0.96); }
+
+      .mm-math {
+        color: rgba(255, 248, 235, 0.98);
+        font-family: 'Cambria Math', 'STIX Two Math', serif;
+      }
+      .mm-math-inline {
+        display: inline-flex;
+        max-width: 100%;
+        padding: 0 2px;
+        overflow-x: auto;
+        vertical-align: -0.08em;
+      }
+      .mm-math-display {
+        display: block;
+        max-width: 100%;
+        margin: 8px 0;
+        padding: 5px 8px;
+        overflow-x: auto;
+        text-align: center;
+        background: rgba(22, 26, 36, calc(var(--mm-opacity) * 0.34));
+        border-left: 2px solid rgba(125, 211, 252, 0.54);
+      }
+      .mm-math math {
+        color: inherit;
+        font-size: 1.05em;
+      }
+      .mm-math-fallback {
+        white-space: pre-wrap;
+      }
 
       .mm-panel-content ul, .mm-panel-content ol {
         padding-left: 22px;
@@ -1960,13 +2672,13 @@
       .mm-panel-content blockquote {
         margin: 9px 0;
         padding: 6px 10px;
-        border-left: 3px solid #89b4fa;
-        color: #bac2de;
-        background: #181825;
+        border-left: 3px solid rgba(125, 211, 252, 0.88);
+        color: rgba(226, 232, 250, 0.94);
+        background: rgba(32, 42, 58, calc(var(--mm-opacity) * 0.72));
       }
 
       .mm-panel-content a {
-        color: #89dceb;
+        color: rgba(103, 232, 249, 0.98);
         text-decoration: underline;
         text-underline-offset: 2px;
       }
@@ -1974,35 +2686,38 @@
       .mm-panel-content hr {
         margin: 12px 0;
         border: 0;
-        border-top: 1px solid #45475a;
+        border-top: 1px solid rgba(148, 163, 184, 0.38);
       }
 
       .mm-table-wrap {
         width: 100%;
         margin: 9px 0;
         overflow-x: auto;
-        border: 1px solid #45475a;
+        border: 1px solid rgba(148, 163, 184, 0.36);
         border-radius: 6px;
+        background: rgba(18, 20, 29, calc(var(--mm-opacity) * 0.3));
       }
 
       .mm-panel-content table {
         width: 100%;
         border-collapse: collapse;
         white-space: nowrap;
+        background: rgba(18, 20, 29, calc(var(--mm-opacity) * 0.22));
       }
 
       .mm-panel-content th,
       .mm-panel-content td {
         padding: 7px 9px;
-        border-right: 1px solid #45475a;
-        border-bottom: 1px solid #45475a;
+        border-right: 1px solid rgba(148, 163, 184, 0.32);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.32);
+        background: rgba(28, 32, 43, calc(var(--mm-opacity) * 0.34));
         text-align: left;
         vertical-align: top;
       }
 
       .mm-panel-content th {
-        background: #252536;
-        color: #f5e0dc;
+        background: rgba(45, 51, 66, calc(var(--mm-opacity) * 0.9));
+        color: rgba(255, 241, 242, 0.98);
         font-weight: 600;
       }
 
@@ -2016,20 +2731,78 @@
       }
 
       .mm-fusion-content {
-        background: #18211d;
+        background: rgba(13, 38, 30, var(--mm-opacity));
       }
 
       /* Scrollbar */
       ::-webkit-scrollbar { width: 6px; }
       ::-webkit-scrollbar-track { background: transparent; }
-      ::-webkit-scrollbar-thumb { background: #45475a; border-radius: 3px; }
-      ::-webkit-scrollbar-thumb:hover { background: #585b70; }
+      ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.46); border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(203, 213, 225, 0.62); }
+
+      @media (max-width: 560px) {
+        .mm-main {
+          width: calc(100vw - 8px);
+          min-width: 0;
+          height: min(280px, calc(100vh - 8px));
+          min-height: min(216px, calc(100vh - 8px));
+          grid-template-columns: minmax(0, 1fr);
+          grid-template-rows: 38px 42px minmax(0, 1fr);
+          grid-template-areas:
+            "header"
+            "rail"
+            "content";
+        }
+
+        .mm-panel-tabs {
+          flex-direction: row;
+          overflow-x: auto;
+          overflow-y: hidden;
+          border-left: 0;
+          border-bottom: 1px solid rgba(148, 163, 184, 0.32);
+        }
+
+        .mm-panel-tab {
+          flex: 0 0 86px;
+          height: 31px;
+          border-left: 0;
+          border-bottom: 2px solid rgba(0, 0, 0, 0.01);
+        }
+
+        .mm-panel-tab.is-active {
+          border-left-color: rgba(0, 0, 0, 0.01);
+          border-bottom-color: rgba(125, 211, 252, 0.96);
+        }
+
+        .mm-fusion-tab.is-active {
+          border-bottom-color: rgba(110, 231, 183, 0.96);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        * { scroll-behavior: auto !important; transition: none !important; }
+      }
     `
   }
 
   // ============================================================
   // 9. Toggle Button (floating)
   // ============================================================
+
+  function updateToggleButton(btn) {
+    if (!btn) return
+    const statusText = state.enabled ? '已开启' : '已关闭'
+    btn.setAttribute('aria-pressed', String(state.enabled))
+    btn.setAttribute('aria-label', `多模型对比${statusText}；左键启停，右键显示或隐藏面板`)
+    btn.title = `多模型对比 v${SCRIPT_VERSION}：${statusText}；左键启停，右键显示或隐藏面板`
+    btn.style.background = state.enabled ? 'rgba(43, 47, 61, 0.76)' : 'rgba(69, 71, 90, 0.56)'
+    btn.style.borderColor = state.enabled ? 'rgba(196, 181, 253, 0.78)' : 'rgba(148, 163, 184, 0.48)'
+    const statusDot = btn.querySelector('.mm-floating-status')
+    if (statusDot) {
+      statusDot.style.background = state.enabled ? '#86efac' : '#cbd5e1'
+      statusDot.style.boxShadow = state.enabled ? '0 0 0 3px rgba(134, 239, 172, 0.16)' : 'none'
+    }
+  }
 
   function createToggleButton() {
     if (!document.body) return null
@@ -2038,37 +2811,49 @@
     if (isConnected(existing)) return existing
     if (existing) existing.remove()
 
-    const btn = document.createElement('div')
+    const btn = document.createElement('button')
+    btn.type = 'button'
     btn.id = `${SCRIPT_ID}-toggle`
     btn.style.cssText = `
       position: fixed;
       bottom: 80px;
       right: 20px;
-      z-index: 999998;
-      width: 44px;
-      height: 44px;
-      border-radius: 50%;
-      background: ${state.enabled ? '#cba6f7' : '#45475a'};
-      color: ${state.enabled ? '#1e1e2e' : '#cdd6f4'};
+      z-index: 1000000;
+      width: 82px;
+      height: 36px;
+      border: 1px solid rgba(148, 163, 184, 0.48);
+      border-radius: 18px;
+      background: rgba(69, 71, 90, 0.56);
+      color: #f8fafc;
       display: flex;
       align-items: center;
       justify-content: center;
+      gap: 7px;
+      padding: 0 11px;
       cursor: pointer;
-      font-size: 18px;
-      font-weight: bold;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-      transition: all 0.2s;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.22);
+      transition: background 0.2s, border-color 0.2s, transform 0.2s;
       user-select: none;
     `
-    btn.textContent = 'M'
-    btn.title = `Multi-Model Compare v${SCRIPT_VERSION}: ${state.enabled ? 'ON' : 'OFF'}`
+
+    const statusDot = document.createElement('span')
+    statusDot.className = 'mm-floating-status'
+    statusDot.style.cssText = 'width:7px;height:7px;border-radius:50%;flex:0 0 auto;'
+    const label = document.createElement('span')
+    label.className = 'mm-floating-label'
+    label.textContent = '多模型'
+    btn.appendChild(statusDot)
+    btn.appendChild(label)
+    updateToggleButton(btn)
 
     btn.addEventListener('click', () => {
       state.enabled = !state.enabled
       persistState()
-      btn.style.background = state.enabled ? '#cba6f7' : '#45475a'
-      btn.style.color = state.enabled ? '#1e1e2e' : '#cdd6f4'
-      btn.title = `Multi-Model Compare v${SCRIPT_VERSION}: ${state.enabled ? 'ON' : 'OFF'}`
+      updateToggleButton(btn)
 
       if (state.enabled && !state.panelVisible) {
         ensurePanelVisible()
@@ -2104,9 +2889,13 @@
     persistState()
     const toggleBtn = document.getElementById(`${SCRIPT_ID}-toggle`)
     if (toggleBtn) {
-      toggleBtn.style.background = state.enabled ? '#cba6f7' : '#45475a'
-      toggleBtn.style.color = state.enabled ? '#1e1e2e' : '#cdd6f4'
-      toggleBtn.title = `Multi-Model Compare v${SCRIPT_VERSION}: ${state.enabled ? 'ON' : 'OFF'}`
+      updateToggleButton(toggleBtn)
+    }
+    if (state.enabled && !state.panelVisible) {
+      ensurePanelVisible()
+    } else if (!state.enabled && mainContainer) {
+      mainContainer.style.display = 'none'
+      state.panelVisible = false
     }
     console.log(`[${SCRIPT_ID}] ${state.enabled ? 'Enabled' : 'Disabled'} via menu`)
   })
@@ -2117,14 +2906,73 @@
     state.staggerMs = DEFAULT_STAGGER_MS
     state.fusionEnabled = true
     state.fusionAutoRun = true
+    state.panelOpacity = DEFAULT_PANEL_OPACITY
+    state.panelPosition = null
+    state.panelSize = null
     persistState()
     console.log(`[${SCRIPT_ID}] Settings reset to defaults`)
     location.reload()
   })
 
   // ============================================================
-  // 11. Drag Support
+  // 11. Drag and Resize Support
   // ============================================================
+
+  function installViewportConstraints() {
+    if (viewportListenerInstalled) return
+    viewportListenerInstalled = true
+    window.addEventListener('resize', () => constrainPanelToViewport(true))
+  }
+
+  function restorePanelPosition() {
+    const width = Number(state.panelSize?.width)
+    const height = Number(state.panelSize?.height)
+    const left = Number(state.panelPosition?.left)
+    const top = Number(state.panelPosition?.top)
+
+    if (Number.isFinite(width) && Number.isFinite(height)) {
+      mainContainer.style.width = `${width}px`
+      mainContainer.style.height = `${height}px`
+    }
+    if (Number.isFinite(left) && Number.isFinite(top)) {
+      mainContainer.style.right = 'auto'
+      mainContainer.style.left = `${left}px`
+      mainContainer.style.top = `${top}px`
+    }
+    requestAnimationFrame(() => constrainPanelToViewport())
+  }
+
+  function getPanelMinimumSize() {
+    return {
+      width: Math.min(window.innerWidth <= 560 ? 280 : 360, Math.max(1, window.innerWidth)),
+      height: Math.min(216, Math.max(1, window.innerHeight)),
+    }
+  }
+
+  function constrainPanelToViewport(shouldPersist = false) {
+    if (!isConnected(mainContainer) || mainContainer.style.display === 'none') return
+
+    const minimum = getPanelMinimumSize()
+    let rect = mainContainer.getBoundingClientRect()
+    const width = clamp(rect.width, minimum.width, Math.max(minimum.width, window.innerWidth))
+    const height = clamp(rect.height, minimum.height, Math.max(minimum.height, window.innerHeight))
+    if (Math.abs(width - rect.width) > 0.5) mainContainer.style.width = `${width}px`
+    if (Math.abs(height - rect.height) > 0.5) mainContainer.style.height = `${height}px`
+
+    rect = mainContainer.getBoundingClientRect()
+    const maxLeft = Math.max(0, window.innerWidth - rect.width)
+    const maxTop = Math.max(0, window.innerHeight - rect.height)
+    const left = clamp(rect.left, 0, maxLeft)
+    const top = clamp(rect.top, 0, maxTop)
+    mainContainer.style.right = 'auto'
+    mainContainer.style.left = `${left}px`
+    mainContainer.style.top = `${top}px`
+    if (shouldPersist) {
+      state.panelPosition = { left: Math.round(left), top: Math.round(top) }
+      state.panelSize = { width: Math.round(rect.width), height: Math.round(rect.height) }
+      persistState()
+    }
+  }
 
   function enableDrag() {
     if (!shadowRoot) return
@@ -2132,30 +2980,119 @@
     if (!header) return
 
     let isDragging = false
-    let startX, startY, origRight, origTop
+    let startX = 0
+    let startY = 0
+    let origLeft = 0
+    let origTop = 0
+    let panelWidth = 0
+    let panelHeight = 0
 
-    header.addEventListener('mousedown', (e) => {
-      if (e.target.tagName === 'BUTTON') return
+    header.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.target.closest('button, input, label')) return
       isDragging = true
-      startX = e.clientX
-      startY = e.clientY
+      startX = event.clientX
+      startY = event.clientY
       const rect = mainContainer.getBoundingClientRect()
-      origRight = window.innerWidth - rect.right
+      origLeft = rect.left
       origTop = rect.top
-      e.preventDefault()
+      panelWidth = rect.width
+      panelHeight = rect.height
+      mainContainer.style.right = 'auto'
+      mainContainer.style.left = `${origLeft}px`
+      header.setPointerCapture(event.pointerId)
+      event.preventDefault()
     })
 
-    document.addEventListener('mousemove', (e) => {
+    header.addEventListener('pointermove', (event) => {
       if (!isDragging) return
-      const dx = e.clientX - startX
-      const dy = e.clientY - startY
-      mainContainer.style.right = `${Math.max(0, origRight - dx)}px`
-      mainContainer.style.top = `${Math.max(0, origTop + dy)}px`
+      const maxLeft = Math.max(0, window.innerWidth - panelWidth)
+      const maxTop = Math.max(0, window.innerHeight - panelHeight)
+      const left = clamp(origLeft + event.clientX - startX, 0, maxLeft)
+      const top = clamp(origTop + event.clientY - startY, 0, maxTop)
+      mainContainer.style.left = `${left}px`
+      mainContainer.style.top = `${top}px`
     })
 
-    document.addEventListener('mouseup', () => {
+    const finishDrag = (event) => {
+      if (!isDragging) return
       isDragging = false
-    })
+      if (header.hasPointerCapture(event.pointerId)) header.releasePointerCapture(event.pointerId)
+      constrainPanelToViewport(true)
+    }
+
+    header.addEventListener('pointerup', finishDrag)
+    header.addEventListener('pointercancel', finishDrag)
+
+    installViewportConstraints()
+  }
+
+  function enableResize() {
+    if (!shadowRoot || !mainContainer) return
+    const handles = shadowRoot.querySelectorAll('.mm-resize-handle')
+
+    for (const handle of handles) {
+      let isResizing = false
+      let startX = 0
+      let startY = 0
+      let originalRect = null
+
+      handle.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0) return
+        isResizing = true
+        startX = event.clientX
+        startY = event.clientY
+        originalRect = mainContainer.getBoundingClientRect()
+        mainContainer.style.right = 'auto'
+        mainContainer.style.left = `${originalRect.left}px`
+        mainContainer.style.top = `${originalRect.top}px`
+        mainContainer.style.width = `${originalRect.width}px`
+        mainContainer.style.height = `${originalRect.height}px`
+        handle.setPointerCapture(event.pointerId)
+        event.preventDefault()
+        event.stopPropagation()
+      })
+
+      handle.addEventListener('pointermove', (event) => {
+        if (!isResizing || !originalRect) return
+        const direction = handle.dataset.direction || ''
+        const deltaX = event.clientX - startX
+        const deltaY = event.clientY - startY
+        const minimum = getPanelMinimumSize()
+        let left = originalRect.left
+        let right = originalRect.right
+        let top = originalRect.top
+        let bottom = originalRect.bottom
+
+        if (direction.includes('e')) {
+          right = clamp(originalRect.right + deltaX, originalRect.left + minimum.width, window.innerWidth)
+        }
+        if (direction.includes('w')) {
+          left = clamp(originalRect.left + deltaX, 0, originalRect.right - minimum.width)
+        }
+        if (direction.includes('s')) {
+          bottom = clamp(originalRect.bottom + deltaY, originalRect.top + minimum.height, window.innerHeight)
+        }
+        if (direction.includes('n')) {
+          top = clamp(originalRect.top + deltaY, 0, originalRect.bottom - minimum.height)
+        }
+
+        mainContainer.style.left = `${left}px`
+        mainContainer.style.top = `${top}px`
+        mainContainer.style.width = `${right - left}px`
+        mainContainer.style.height = `${bottom - top}px`
+      })
+
+      const finishResize = (event) => {
+        if (!isResizing) return
+        isResizing = false
+        originalRect = null
+        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId)
+        constrainPanelToViewport(true)
+      }
+
+      handle.addEventListener('pointerup', finishResize)
+      handle.addEventListener('pointercancel', finishResize)
+    }
   }
 
   function ensureUiMounted() {
@@ -2208,6 +3145,7 @@
     mainContainer = null
     state.panels = new Map()
 
+    restoreRunSnapshot()
     createToggleButton()
     if (state.enabled) {
       ensurePanelVisible()
@@ -2216,6 +3154,8 @@
 
     console.log(`[${SCRIPT_ID}] Initialized. Enabled: ${state.enabled}`)
   }
+
+  window.addEventListener('pagehide', saveRunSnapshotNow)
 
   // The fetch hook is installed at document-start (above).
   // UI elements wait for DOM ready.

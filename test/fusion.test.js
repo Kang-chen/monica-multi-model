@@ -7,6 +7,9 @@ const CHROME_PATH = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const SRC_PATH = path.resolve(__dirname, '..', 'monica-multi-model.user.js')
 const MARKDOWN_IT_URL = 'https://cdn.jsdelivr.net/npm/markdown-it@14.3.0/dist/markdown-it.min.js'
 const DOMPURIFY_URL = 'https://cdn.jsdelivr.net/npm/dompurify@3.4.7/dist/purify.min.js'
+const KATEX_URL = 'https://cdn.jsdelivr.net/npm/katex@0.18.0/dist/katex.min.js'
+const HEADLESS = !['0', 'false'].includes(String(process.env.HEADLESS || '').toLowerCase())
+const SLOW_MO = Math.max(0, Number(process.env.SLOW_MO || 0))
 
 function buildScript() {
   const source = fs
@@ -49,13 +52,43 @@ function buildRequestBody() {
   }
 }
 
+function alphaOf(color) {
+  const values = color.match(/[\d.]+/g)?.map(Number) || []
+  return values.length >= 4 ? values[3] : 1
+}
+
 (async () => {
-  const browser = await chromium.launch({ executablePath: CHROME_PATH, headless: true })
+  const browser = await chromium.launch({
+    executablePath: CHROME_PATH,
+    headless: HEADLESS,
+    slowMo: SLOW_MO,
+  })
   const page = await browser.newPage()
   page.on('pageerror', (error) => console.error('page error:', error.message))
 
   try {
-    await page.setContent('<!doctype html><html><body><main id="root"></main></body></html>')
+    await page.route('http://fusion.test/**', (route) => {
+      route.fulfill({
+        contentType: 'text/html',
+        body: `
+          <!doctype html>
+          <html>
+            <body style="margin:0;background:#f8fafc;color:#172033">
+              <main id="root" style="padding:72px 48px">
+                <h1>Monica conversation</h1>
+                <p id="underlay">This content must remain visible beneath the Fusion reader.</p>
+                <section style="position:fixed;top:64px;right:16px;width:420px;color:#2563eb;line-height:1.8">
+                  <strong>Underlying Monica answer</strong>
+                  <p>Visible page text behind the translucent Fusion body.</p>
+                  <p>Original response content remains readable enough to keep context.</p>
+                </section>
+              </main>
+            </body>
+          </html>
+        `,
+      })
+    })
+    await page.goto('http://fusion.test/chat')
     await page.evaluate(() => {
       window.__fusionTest = { calls: [], finishes: [], reloads: 0, copiedPrompt: '' }
       Object.defineProperty(navigator, 'clipboard', {
@@ -90,6 +123,10 @@ function buildRequestBody() {
               '',
               '> 关键提醒：发布前必须验证回滚。',
               '',
+              '这个区域大约是 $$0.785$$ 平方米，在 $n$ 维空间中仍需保持**完整维数**。',
+              '',
+              '$$\\dim_H(K)=n$$',
+              '',
               '| 阶段 | 检查项 |',
               '| --- | --- |',
               '| 发布前 | 迁移与回滚 |',
@@ -97,11 +134,13 @@ function buildRequestBody() {
               '',
               '1. 确认负责人和发布窗口。',
               '2. 记录验证结果。',
+              '3. 使用 `release-marker` 标记发布。',
               '',
               '[发布文档](https://example.com/release)',
               '',
               '```js',
               'console.log("release ready")',
+              'const formula = "$n$"',
               '```',
               '',
               '<img src=x onerror="window.__markdownXss = true">',
@@ -136,6 +175,7 @@ function buildRequestBody() {
 
     await page.addScriptTag({ url: MARKDOWN_IT_URL })
     await page.addScriptTag({ url: DOMPURIFY_URL })
+    await page.addScriptTag({ url: KATEX_URL })
     await page.evaluate(buildScript())
     await page.waitForFunction(() => document.getElementById('monica-mm-host'))
 
@@ -194,6 +234,45 @@ function buildRequestBody() {
       )
       promptButton.click()
       await new Promise((resolve) => setTimeout(resolve, 0))
+      const activePanelAfterSwitch = root.querySelector('.mm-panel.is-active')?.dataset.modelId
+      const gptScrollTopAfterSwitch = gptContent.scrollTop
+      const gptScrollHeight = gptContent.scrollHeight
+      const gptClientHeight = gptContent.clientHeight
+      fusionTab.click()
+      const main = root.querySelector('.mm-main')
+      const tabs = root.querySelector('.mm-panel-tabs')
+      const settingsButton = root.querySelector('button[title="Settings"]')
+      settingsButton.click()
+      const settings = root.querySelector('.mm-settings')
+      const settingsFusionModel = settings.querySelector('#mm-fusion-model')
+      const panelFusionModel = fusionPanel.querySelector('select[aria-label="Fusion model"]')
+      const surfaceSelectors = {
+        main: '.mm-main',
+        header: '.mm-header',
+        tabs: '.mm-panel-tabs',
+        panel: '.mm-fusion-panel',
+        panelHeader: '.mm-fusion-panel .mm-panel-header',
+        content: '.mm-fusion-content',
+        settings: '.mm-settings',
+        blockquote: '.mm-fusion-content blockquote',
+        table: '.mm-fusion-content table',
+        tableHeader: '.mm-fusion-content th',
+        tableCell: '.mm-fusion-content td',
+        inlineCode: '.mm-fusion-content li code',
+        fencedCode: '.mm-fusion-content pre',
+        fencedCodeText: '.mm-fusion-content pre code',
+        mathDisplay: '.mm-fusion-content .mm-math-display',
+      }
+      const surfaceColors = Object.fromEntries(
+        Object.entries(surfaceSelectors).map(([name, selector]) => [
+          name,
+          getComputedStyle(root.querySelector(selector)).backgroundColor,
+        ]),
+      )
+      settingsButton.click()
+      const mainRect = main.getBoundingClientRect()
+      const tabsRect = tabs.getBoundingClientRect()
+      const panelsRect = root.querySelector('.mm-panels').getBoundingClientRect()
       return {
         calls: window.__fusionTest.calls,
         finishes: window.__fusionTest.finishes,
@@ -202,9 +281,11 @@ function buildRequestBody() {
         tabCount: root.querySelectorAll('.mm-panel-tab').length,
         initiallyActiveTab,
         fusionTabPosition: getComputedStyle(fusionTab).position,
-        activePanelAfterSwitch: root.querySelector('.mm-panel.is-active')?.dataset.modelId,
+        activePanelAfterSwitch,
         keyboardActivePanel,
-        gptScrollTopAfterSwitch: gptContent.scrollTop,
+        gptScrollTopAfterSwitch,
+        gptScrollHeight,
+        gptClientHeight,
         modelPanels: modelPanels.map((panel) => ({
           label: panel.querySelector('.mm-panel-label')?.textContent,
           status: panel.querySelector('.mm-panel-status')?.textContent,
@@ -212,14 +293,37 @@ function buildRequestBody() {
         })),
         fusionStatus: fusionPanel.querySelector('.mm-panel-status')?.textContent,
         fusionText: fusionPanel.querySelector('.mm-panel-content')?.textContent,
+        fusionModel: {
+          settingsValue: settingsFusionModel?.value,
+          panelValue: panelFusionModel?.value,
+          settingsOptions: [...(settingsFusionModel?.options || [])].map((option) => ({
+            value: option.value,
+            text: option.textContent,
+          })),
+          panelOptions: [...(panelFusionModel?.options || [])].map((option) => ({
+            value: option.value,
+            text: option.textContent,
+          })),
+        },
         markdown: {
           heading: fusionPanel.querySelectorAll('h1').length,
           blockquote: fusionPanel.querySelectorAll('blockquote').length,
           table: fusionPanel.querySelectorAll('.mm-table-wrap table').length,
           codeBlock: fusionPanel.querySelectorAll('pre code').length,
           codeCopy: fusionPanel.querySelectorAll('.mm-code-copy').length,
+          strong: fusionPanel.querySelectorAll('strong').length,
+          mathInline: fusionPanel.querySelectorAll('.mm-math-inline math').length,
+          mathDisplay: fusionPanel.querySelectorAll('.mm-math-display math').length,
+          mathInsideCode: fusionPanel.querySelectorAll('pre .mm-math').length,
+          rawMathDelimiters: (fusionPanel.querySelector('.mm-panel-content')?.textContent.match(/\$\$/g) || []).length,
           safeLink: fusionPanel.querySelector('a')?.rel === 'noopener noreferrer',
           unsafeImage: fusionPanel.querySelectorAll('img').length,
+        },
+        surfaceColors,
+        layout: {
+          width: mainRect.width,
+          height: mainRect.height,
+          tabsAreRightOfContent: tabsRect.left >= panelsRect.right - 1,
         },
         href: location.href,
       }
@@ -228,21 +332,57 @@ function buildRequestBody() {
     assert.strictEqual(result.modelPanels.length, 3, 'renders exactly three panel model results')
     assert(result.modelPanels.every((panel) => panel.status === 'done'), 'all panel model results complete')
     assert.strictEqual(result.fusionStatus, 'done', 'Fusion reaches done without a refresh')
+    assert.strictEqual(result.fusionModel.settingsValue, 'auto', 'settings default Fusion model to Auto')
+    assert.strictEqual(result.fusionModel.panelValue, 'auto', 'Fusion dialog defaults to Auto')
+    assert.deepStrictEqual(
+      result.fusionModel.panelOptions.map((option) => option.value),
+      result.fusionModel.settingsOptions.map((option) => option.value),
+      'settings and Fusion dialog expose the same model list',
+    )
+    assert.strictEqual(result.fusionModel.panelOptions[0].value, 'auto', 'model list starts with Auto')
+    assert.strictEqual(
+      result.fusionModel.panelOptions[0].text,
+      'Auto (Claude 5 Sonnet)',
+      'Fusion dialog explains which current model Auto resolves to',
+    )
     assert(result.fusionText.includes('融合后的答案'), 'Fusion result is rendered as formatted content')
-    assert.strictEqual(result.href, 'about:blank', 'the current page is not reloaded or navigated')
+    assert.strictEqual(result.href, 'http://fusion.test/chat', 'the current page is not reloaded or navigated')
     assert.strictEqual(result.tabCount, 4, 'renders one navigation tab per agent plus Fusion')
-    assert.strictEqual(result.initiallyActiveTab, '__fusion__', 'automatically selects Fusion when synthesis starts')
-    assert.strictEqual(result.fusionTabPosition, 'sticky', 'keeps the Fusion tab visible while agent tabs scroll')
+    assert.strictEqual(
+      result.initiallyActiveTab,
+      'gemini-3.5-flash-thinking',
+      'Fusion completion does not steal the active agent view',
+    )
+    assert.strictEqual(result.fusionTabPosition, 'relative', 'Fusion stays in the compact agent rail')
     assert.strictEqual(result.activePanelAfterSwitch, 'gpt-5.5', 'agent tabs switch the visible result')
     assert.strictEqual(result.keyboardActivePanel, 'claude-sonnet-5', 'arrow keys navigate between agent results')
-    assert(result.gptScrollTopAfterSwitch > 0, 'each agent result preserves its own scroll position')
+    assert(
+      result.gptScrollTopAfterSwitch > 0,
+      `each agent result preserves its own scroll position (${JSON.stringify({
+        top: result.gptScrollTopAfterSwitch,
+        height: result.gptScrollHeight,
+        client: result.gptClientHeight,
+      })})`,
+    )
     assert.strictEqual(result.markdown.heading, 1, 'renders Markdown headings')
     assert.strictEqual(result.markdown.blockquote, 1, 'renders Markdown blockquotes')
     assert.strictEqual(result.markdown.table, 1, 'renders responsive Markdown tables')
     assert.strictEqual(result.markdown.codeBlock, 1, 'renders fenced code blocks')
     assert.strictEqual(result.markdown.codeCopy, 1, 'adds a copy action to code blocks')
+    assert.strictEqual(result.markdown.strong, 1, 'renders bold text next to Chinese punctuation')
+    assert.strictEqual(result.markdown.mathInline, 2, 'renders inline single- and double-dollar math with KaTeX')
+    assert.strictEqual(result.markdown.mathDisplay, 1, 'renders standalone double-dollar math in display mode')
+    assert.strictEqual(result.markdown.mathInsideCode, 0, 'does not render dollar syntax inside fenced code')
+    assert.strictEqual(result.markdown.rawMathDelimiters, 0, 'removes raw double-dollar delimiters from rendered prose')
     assert(result.markdown.safeLink, 'external links use noopener noreferrer')
     assert.strictEqual(result.markdown.unsafeImage, 0, 'raw unsafe HTML is not rendered')
+    assert(result.layout.width <= 429, 'G2 reader remains compact')
+    assert(result.layout.height >= 216 && result.layout.height <= 300, 'G2 reader uses the intended reading height')
+    assert(result.layout.tabsAreRightOfContent, 'desktop G2 navigation rail is placed to the right')
+    for (const [surface, color] of Object.entries(result.surfaceColors)) {
+      const alpha = alphaOf(color)
+      assert(alpha > 0 && alpha < 0.76, `${surface} uses a real translucent background (${color})`)
+    }
 
     const fusionCall = result.calls.find((call) => call.isFusion)
     assert(fusionCall, 'a Fusion judge request is sent')
@@ -319,6 +459,74 @@ function buildRequestBody() {
     const latestPanelFinish = Math.max(...result.finishes.filter((item) => !item.isFusion).map((item) => item.finishedAt))
     assert(fusionCall.startedAt >= latestPanelFinish, 'Fusion starts only after all three panel results finish')
 
+    await page.waitForFunction(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      return root && !root.querySelector('.mm-fusion-panel .mm-icon-btn')?.disabled
+    })
+    await page.evaluate(() => {
+      const root = document.getElementById('monica-mm-host').shadowRoot
+      const settingsSelect = root.querySelector('#mm-fusion-model')
+      const panelSelect = root.querySelector('select[aria-label="Fusion model"]')
+      settingsSelect.value = 'gpt-5.5'
+      settingsSelect.dispatchEvent(new Event('change', { bubbles: true }))
+      if (panelSelect.value !== 'gpt-5.5') {
+        throw new Error(`Fusion dialog did not sync settings selection: ${panelSelect.value}`)
+      }
+      root.querySelector('.mm-fusion-panel .mm-icon-btn').click()
+    })
+    await page.waitForFunction(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      const calls = window.__fusionTest.calls.filter((call) => call.isFusion)
+      return calls.length >= 2
+        && root?.querySelector('.mm-fusion-panel .mm-panel-status')?.textContent === 'done'
+    })
+    let rerun = await page.evaluate(() => {
+      const root = document.getElementById('monica-mm-host').shadowRoot
+      return {
+        calls: window.__fusionTest.calls.filter((call) => call.isFusion),
+        selected: root.querySelector('select[aria-label="Fusion model"]')?.value,
+        label: root.querySelector('.mm-fusion-label')?.textContent,
+      }
+    })
+    assert.strictEqual(rerun.calls[1].model, 'gpt-5.5', 'non-Auto settings selection controls Fusion')
+    assert.strictEqual(rerun.selected, 'gpt-5.5', 'Fusion dialog reflects the settings selection')
+    assert(rerun.label.includes('GPT-5.5'), 'rerun result identifies the selected Fusion model')
+
+    await page.waitForFunction(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      return root && !root.querySelector('.mm-fusion-panel .mm-icon-btn')?.disabled
+    })
+    await page.evaluate(() => {
+      const root = document.getElementById('monica-mm-host').shadowRoot
+      const panelSelect = root.querySelector('select[aria-label="Fusion model"]')
+      panelSelect.value = 'gemini-3.5-flash-thinking'
+      panelSelect.dispatchEvent(new Event('change', { bubbles: true }))
+      root.querySelector('.mm-fusion-panel .mm-icon-btn').click()
+    })
+    await page.waitForFunction(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      const calls = window.__fusionTest.calls.filter((call) => call.isFusion)
+      return calls.length >= 3
+        && root?.querySelector('.mm-fusion-panel .mm-panel-status')?.textContent === 'done'
+    })
+    rerun = await page.evaluate(() => ({
+      calls: window.__fusionTest.calls.filter((call) => call.isFusion),
+      selected: document
+        .getElementById('monica-mm-host')
+        .shadowRoot
+        .querySelector('select[aria-label="Fusion model"]')?.value,
+    }))
+    assert.strictEqual(
+      rerun.calls[2].model,
+      'gemini-3.5-flash-thinking',
+      'Fusion dialog model selection controls a manual rerun',
+    )
+    assert.strictEqual(
+      rerun.selected,
+      'gemini-3.5-flash-thinking',
+      'Fusion dialog keeps the manually selected model after rerun',
+    )
+
     await page.evaluate(() => {
       const fusionTab = document
         .getElementById('monica-mm-host')
@@ -331,6 +539,93 @@ function buildRequestBody() {
       path: path.join(__dirname, 'screenshots', 'T7-markdown-tabs.png'),
       fullPage: true,
     })
+
+    await page.setViewportSize({ width: 500, height: 700 })
+    await page.waitForTimeout(100)
+    const narrowLayout = await page.evaluate(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      const main = root?.querySelector('.mm-main')
+      const tabs = root?.querySelector('.mm-panel-tabs')
+      const panels = root?.querySelector('.mm-panels')
+      const mainRect = main.getBoundingClientRect()
+      const tabsRect = tabs.getBoundingClientRect()
+      const panelsRect = panels.getBoundingClientRect()
+
+      return {
+        width: mainRect.width,
+        right: mainRect.right,
+        tabsDirection: getComputedStyle(tabs).flexDirection,
+        tabsAboveContent: tabsRect.bottom <= panelsRect.top + 1,
+      }
+    })
+    assert(narrowLayout.width <= 493, 'narrow G2 reader stays inside the viewport')
+    assert(narrowLayout.right <= 500, 'narrow G2 reader does not overflow to the right')
+    assert.strictEqual(narrowLayout.tabsDirection, 'row', 'narrow navigation switches to a horizontal row')
+    assert(narrowLayout.tabsAboveContent, 'narrow navigation stays above the active result')
+    await page.screenshot({
+      path: path.join(__dirname, 'screenshots', 'T7-g2-transparent-narrow.png'),
+      fullPage: true,
+    })
+
+    await page.waitForTimeout(180)
+    const savedSnapshot = await page.evaluate(() => {
+      const raw = sessionStorage.getItem('monica-mm-run-snapshot')
+      return raw ? JSON.parse(raw) : null
+    })
+    assert(savedSnapshot, 'completed run is saved in the current tab session')
+    assert.strictEqual(savedSnapshot.responses.length, 4, 'snapshot contains three agents and Fusion')
+    assert(
+      savedSnapshot.responses.some((response) =>
+        response.modelId === '__fusion__' && response.finalText.includes('\u878d\u5408\u540e\u7684\u7b54\u6848')),
+      'snapshot contains the formatted Fusion result',
+    )
+    assert.strictEqual(savedSnapshot.activePanelId, '__fusion__', 'snapshot remembers the selected result')
+    assert.strictEqual(savedSnapshot.fusionPrompt, fusionCall.prompt, 'snapshot retains the submitted Fusion prompt')
+    assert.strictEqual(
+      savedSnapshot.fusionModelId,
+      'gemini-3.5-flash-thinking',
+      'snapshot retains the Fusion model selected for rerun',
+    )
+
+    await page.addInitScript({ content: buildScript() })
+    await page.reload()
+    await page.waitForFunction(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      const fusion = root?.querySelector('.mm-fusion-panel')
+      return fusion?.querySelector('.mm-panel-status')?.textContent === 'done'
+    })
+    await page.waitForTimeout(50)
+    const restored = await page.evaluate(() => {
+      const root = document.getElementById('monica-mm-host')?.shadowRoot
+      const fusion = root?.querySelector('.mm-fusion-panel')
+      return {
+        tabCount: root?.querySelectorAll('.mm-panel-tab').length,
+        modelTexts: [...(root?.querySelectorAll('.mm-panel:not(.mm-fusion-panel)') || [])]
+          .map((panel) => panel.querySelector('.mm-panel-content')?.textContent || ''),
+        fusionText: fusion?.querySelector('.mm-panel-content')?.textContent || '',
+        activePanelId: root?.querySelector('.mm-panel.is-active')?.dataset.modelId,
+        copyDisabled: fusion?.querySelector(
+          'button[title="Copy the prompt submitted to the Fusion model"]',
+        )?.disabled,
+        runDisabled: fusion?.querySelector('button')?.disabled,
+        fusionModel: fusion?.querySelector('select[aria-label="Fusion model"]')?.value,
+      }
+    })
+    assert.strictEqual(restored.tabCount, 4, 'refresh restores all agent and Fusion tabs')
+    assert.strictEqual(restored.modelTexts.length, 3, 'refresh restores all three agent answers')
+    assert(restored.modelTexts.every((text) => text.trim()), 'restored agent answers remain non-empty')
+    assert(
+      restored.fusionText.includes('\u878d\u5408\u540e\u7684\u7b54\u6848'),
+      'refresh restores the Fusion result without a new prompt',
+    )
+    assert.strictEqual(restored.activePanelId, '__fusion__', 'refresh restores the selected result')
+    assert.strictEqual(restored.copyDisabled, false, 'refresh keeps Fusion prompt copy available')
+    assert.strictEqual(restored.runDisabled, true, 'restored result cannot rerun without a new prompt request')
+    assert.strictEqual(
+      restored.fusionModel,
+      'gemini-3.5-flash-thinking',
+      'refresh restores the Fusion model used by the latest run',
+    )
 
     console.log('fusion tests passed')
   } finally {
