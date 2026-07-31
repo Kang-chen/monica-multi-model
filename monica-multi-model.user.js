@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monica Multi-Model Compare
 // @namespace    https://monica.im/
-// @version      1.1.0-b0
+// @version      1.1.0-b59
 // @description  同一问题同时发送给多个模型，并排显示回答。复用 Monica Web 端 session，零额外成本。
 // @author       Kang
 // @match        https://monica.im/*
@@ -29,7 +29,7 @@
   // ============================================================
 
   const SCRIPT_ID = 'monica-mm'
-  const SCRIPT_VERSION = '1.1.0-b0'
+  const SCRIPT_VERSION = '1.1.0-b59'
   const STORAGE_KEY_ENABLED = `${SCRIPT_ID}-enabled`
   const STORAGE_KEY_MODELS = `${SCRIPT_ID}-models`
   const STORAGE_KEY_ENDPOINT = `${SCRIPT_ID}-endpoint`
