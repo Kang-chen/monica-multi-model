@@ -223,6 +223,12 @@ async function testVersionNumber() {
   if (headerMatch) {
     const versionStr = headerMatch[1];
     assert(/^\d+\.\d+\.\d+-b\d+$/.test(versionStr), `@version header "${versionStr}" matches X.Y.Z-bN format`);
+    const expectedVersion = `${ver.major}.${ver.minor}.${ver.patch}-b${ver.build}`;
+    assert(versionStr === expectedVersion, `Source @version matches version.json (${expectedVersion})`);
+    assert(
+      src.includes(`const SCRIPT_VERSION = '${expectedVersion}'`),
+      `SCRIPT_VERSION matches version.json (${expectedVersion})`,
+    );
   } else {
     assert(false, '@version header exists in source');
   }
@@ -236,9 +242,11 @@ async function testBuildScript() {
   assert(fs.existsSync(buildPath), 'build.js exists');
 
   const distDir = path.resolve(__dirname, '..', 'dist');
+  const versionPath = path.resolve(__dirname, '..', 'version.json');
+  const versionBefore = JSON.parse(fs.readFileSync(versionPath, 'utf8'));
 
   try {
-    execSync('node build.js', { cwd: path.resolve(__dirname, '..'), timeout: 10000 });
+    execSync('node build.js --no-bump', { cwd: path.resolve(__dirname, '..'), timeout: 10000 });
     assert(true, 'build.js runs without error');
   } catch (e) {
     assert(false, `build.js runs without error: ${e.message}`);
@@ -259,14 +267,11 @@ async function testBuildScript() {
     assert(dist.includes(expectedVersion), `dist file contains version ${expectedVersion}`);
   }
 
-  // Build should increment the build number
-  const verBefore = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'version.json'), 'utf8'));
-  const buildBefore = verBefore.build;
-  try {
-    execSync('node build.js', { cwd: path.resolve(__dirname, '..'), timeout: 10000 });
-  } catch (e) { /* ignore */ }
-  const verAfter = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'version.json'), 'utf8'));
-  assert(verAfter.build === buildBefore + 1, `Build number incremented from ${buildBefore} to ${verAfter.build}`);
+  const versionAfter = JSON.parse(fs.readFileSync(versionPath, 'utf8'));
+  assert(
+    versionAfter.build === versionBefore.build,
+    `Test build preserves build number ${versionBefore.build}`,
+  );
 }
 
 // ─── T3: Model switch with staggered concurrent requests ───────
