@@ -183,8 +183,7 @@ async function enableUserscript(page) {
     if (!btn) return { found: false };
 
     const isToggleEnabled = () => {
-      const bg = getComputedStyle(btn).backgroundColor;
-      return btn.title.includes(': ON') || bg === 'rgb(203, 166, 247)';
+      return btn.getAttribute('aria-pressed') === 'true';
     };
 
     const wasEnabled = isToggleEnabled();
@@ -524,7 +523,11 @@ async function testFusionOutput(page) {
     fusionState.fusionModel === fusionState.originalModel,
     `Fusion judge uses current model (${fusionState.fusionModel})`
   );
-  assert(fusionState.fusionPrompt.includes('Independent candidate answers'), 'Fusion prompt contains panel answers');
+  assert(
+    fusionState.fusionPrompt.includes('CANDIDATE_ANSWERS (JSON):')
+      && fusionState.fusionPrompt.includes('"answer":'),
+    'Fusion prompt contains anonymized panel answers'
+  );
 }
 
 // ─── T5: Auto-reload is optional (default OFF) ──────────────────
@@ -558,12 +561,17 @@ async function testUIAfterRefresh(page) {
   const beforeRefresh = await page.evaluate(() => {
     const toggle = document.getElementById('monica-mm-toggle');
     const host = document.getElementById('monica-mm-host');
+    const root = host?.shadowRoot;
     return {
       toggleExists: !!toggle,
       hostExists: !!host,
+      panelTexts: [...(root?.querySelectorAll('.mm-panel') || [])]
+        .map(panel => panel.querySelector('.mm-panel-content')?.textContent || ''),
+      activePanelId: root?.querySelector('.mm-panel.is-active')?.dataset.modelId || null,
     };
   });
   assert(beforeRefresh.toggleExists, 'Toggle button exists BEFORE refresh');
+  assert(beforeRefresh.panelTexts.length >= 4, 'Agent and Fusion results exist BEFORE refresh');
 
   // Refresh the page. addInitScript simulates Tampermonkey's document-start
   // injection; do not manually inject again here, or the test masks refresh bugs.
@@ -577,17 +585,29 @@ async function testUIAfterRefresh(page) {
   const afterRefresh = await page.evaluate(() => {
     const toggle = document.getElementById('monica-mm-toggle');
     const host = document.getElementById('monica-mm-host');
+    const root = host?.shadowRoot;
     return {
       toggleExists: !!toggle,
       toggleVisible: toggle ? getComputedStyle(toggle).display !== 'none' : false,
       hostExists: !!host,
       hostVisible: host ? getComputedStyle(host).display !== 'none' : false,
+      panelTexts: [...(root?.querySelectorAll('.mm-panel') || [])]
+        .map(panel => panel.querySelector('.mm-panel-content')?.textContent || ''),
+      activePanelId: root?.querySelector('.mm-panel.is-active')?.dataset.modelId || null,
     };
   });
 
   assert(afterRefresh.toggleExists, 'Toggle button exists AFTER refresh');
   assert(afterRefresh.toggleVisible, 'Toggle button is VISIBLE after refresh');
   assert(afterRefresh.hostExists, 'Shadow DOM host exists AFTER refresh (when enabled)');
+  assert(
+    JSON.stringify(afterRefresh.panelTexts) === JSON.stringify(beforeRefresh.panelTexts),
+    'Agent and Fusion result content survives refresh without a new prompt'
+  );
+  assert(
+    afterRefresh.activePanelId === beforeRefresh.activePanelId,
+    'Selected Agent or Fusion view survives refresh'
+  );
 
   await page.screenshot({ path: path.join(SCREENSHOTS, 'T6-after-refresh.png') });
 }
