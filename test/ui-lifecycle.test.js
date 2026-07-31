@@ -20,7 +20,10 @@ function buildScript() {
     window.GM_setValue = (key, value) => {
       localStorage.setItem('gm:' + key, JSON.stringify(value));
     };
-    window.GM_registerMenuCommand = () => {};
+    window.__gmMenuCommands = new Map();
+    window.GM_registerMenuCommand = (label, handler) => {
+      window.__gmMenuCommands.set(label, handler);
+    };
   ` + src
 }
 
@@ -47,7 +50,11 @@ async function panelState(page) {
       width: rect?.width,
       height: rect?.height,
       opacity: main ? getComputedStyle(main).getPropertyValue('--mm-opacity').trim() : null,
+      contentFontSize: main
+        ? getComputedStyle(main).getPropertyValue('--mm-content-font-size').trim()
+        : null,
       sliderValue: root?.querySelector('#mm-panel-opacity')?.value,
+      fontSizeSliderValue: root?.querySelector('#mm-content-font-size')?.value,
       resizeDirections: root
         ? [...root.querySelectorAll('.mm-resize-handle')].map((handle) => handle.dataset.direction).sort()
         : [],
@@ -56,6 +63,9 @@ async function panelState(page) {
       southeastGrip: southeastHandle ? getComputedStyle(southeastHandle, '::after').content : null,
       storedEnabled: JSON.parse(localStorage.getItem('gm:monica-mm-enabled') || 'false'),
       storedOpacity: JSON.parse(localStorage.getItem('gm:monica-mm-panel-opacity') || 'null'),
+      storedContentFontSize: JSON.parse(
+        localStorage.getItem('gm:monica-mm-content-font-size') || 'null',
+      ),
       storedPosition: JSON.parse(localStorage.getItem('gm:monica-mm-panel-position') || 'null'),
       storedSize: JSON.parse(localStorage.getItem('gm:monica-mm-panel-size') || 'null'),
     }
@@ -122,6 +132,7 @@ async function resizePanel(page, direction, dx, dy) {
     assert(state.storedEnabled, 'M left click enables and persists the userscript')
     assert.strictEqual(state.display, 'grid', 'M left click opens the G2 reader')
     assert.strictEqual(state.opacity, '0.42', 'G2 reader starts at the readable translucent default')
+    assert.strictEqual(state.contentFontSize, '13px', 'answer text starts at the readable default')
     assert.deepStrictEqual(
       state.resizeDirections,
       ['e', 'n', 'ne', 'nw', 's', 'se', 'sw', 'w'],
@@ -133,14 +144,31 @@ async function resizePanel(page, direction, dx, dy) {
 
     await page.locator('#monica-mm-host').locator('button[title="Settings"]').click()
     const slider = page.locator('#monica-mm-host').locator('#mm-panel-opacity')
+    const fontSizeSlider = page.locator('#monica-mm-host').locator('#mm-content-font-size')
     await slider.evaluate((input) => {
       input.value = '57'
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await fontSizeSlider.evaluate((input) => {
+      input.value = '18'
       input.dispatchEvent(new Event('input', { bubbles: true }))
     })
     await page.locator('#monica-mm-host').locator('button[title="Settings"]').click()
     state = await panelState(page)
     assert.strictEqual(state.opacity, '0.57', 'opacity slider updates the live CSS variable')
     assert.strictEqual(state.storedOpacity, 57, 'opacity slider persists through GM storage')
+    assert.strictEqual(state.contentFontSize, '18px', 'font size slider updates the live CSS variable')
+    assert.strictEqual(state.storedContentFontSize, 18, 'font size slider persists through GM storage')
+    const computedAnswerFontSize = await page.evaluate(() => {
+      const main = document.getElementById('monica-mm-host')?.shadowRoot?.querySelector('.mm-main')
+      const probe = document.createElement('div')
+      probe.className = 'mm-panel-content'
+      main.appendChild(probe)
+      const fontSize = getComputedStyle(probe).fontSize
+      probe.remove()
+      return fontSize
+    })
+    assert.strictEqual(computedAnswerFontSize, '18px', 'answer content inherits the selected font size')
 
     const beforeDrag = state
     await dragPanel(page, -180, 90)
@@ -213,6 +241,8 @@ async function resizePanel(page, direction, dx, dy) {
     assert(state.storedEnabled && state.display === 'grid', 'refresh restores the enabled reader')
     assert.strictEqual(state.sliderValue, '57', 'refresh restores the saved opacity slider')
     assert.strictEqual(state.opacity, '0.57', 'refresh reapplies opacity to all surfaces')
+    assert.strictEqual(state.fontSizeSliderValue, '18', 'refresh restores the saved font size slider')
+    assert.strictEqual(state.contentFontSize, '18px', 'refresh reapplies the answer font size')
     assert(Math.abs(state.left - beforeReload.left) <= 1 && Math.abs(state.top - beforeReload.top) <= 1, 'refresh restores reader position')
     assert(Math.abs(state.width - beforeReload.width) <= 1 && Math.abs(state.height - beforeReload.height) <= 1, 'refresh restores reader dimensions')
 
@@ -229,6 +259,7 @@ async function resizePanel(page, direction, dx, dy) {
     state = await panelState(page)
     assert.strictEqual(state.display, 'grid', 'watchdog restores the visible reader after an SPA remount')
     assert.strictEqual(state.opacity, '0.57', 'SPA remount keeps the saved opacity')
+    assert.strictEqual(state.contentFontSize, '18px', 'SPA remount keeps the saved answer font size')
     assert(Math.abs(state.left - beforeReload.left) <= 1 && Math.abs(state.top - beforeReload.top) <= 1, 'SPA remount keeps the saved position')
     assert(Math.abs(state.width - beforeReload.width) <= 1 && Math.abs(state.height - beforeReload.height) <= 1, 'SPA remount keeps the saved dimensions')
 
@@ -237,6 +268,19 @@ async function resizePanel(page, direction, dx, dy) {
     state = await panelState(page)
     assert(state.left < beforeRemountDrag.left - 40, 'reader remains draggable after an SPA remount')
     assert(state.top < beforeRemountDrag.top - 20, 'remounted drag updates the vertical position')
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+      page.evaluate(() => window.__gmMenuCommands.get('Reset Settings')?.()),
+    ])
+    await page.waitForFunction(() => {
+      const main = document.getElementById('monica-mm-host')?.shadowRoot?.querySelector('.mm-main')
+      return !!main
+        && getComputedStyle(main).getPropertyValue('--mm-content-font-size').trim() === '13px'
+    })
+    state = await panelState(page)
+    assert.strictEqual(state.contentFontSize, '13px', 'Reset Settings restores the default answer font size')
+    assert.strictEqual(state.storedContentFontSize, 13, 'Reset Settings persists the default answer font size')
 
     console.log('ui-lifecycle tests passed')
   } finally {

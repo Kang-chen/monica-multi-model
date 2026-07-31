@@ -39,6 +39,7 @@
   const STORAGE_KEY_FUSION_AUTO_RUN = `${SCRIPT_ID}-fusion-auto-run`
   const STORAGE_KEY_FUSION_MODEL = `${SCRIPT_ID}-fusion-model`
   const STORAGE_KEY_PANEL_OPACITY = `${SCRIPT_ID}-panel-opacity`
+  const STORAGE_KEY_CONTENT_FONT_SIZE = `${SCRIPT_ID}-content-font-size`
   const STORAGE_KEY_PANEL_POSITION = `${SCRIPT_ID}-panel-position`
   const STORAGE_KEY_PANEL_SIZE = `${SCRIPT_ID}-panel-size`
   const SESSION_KEY_RUN_SNAPSHOT = `${SCRIPT_ID}-run-snapshot`
@@ -47,6 +48,9 @@
   const FUSION_MODEL_AUTO = 'auto'
   const PANEL_TIMEOUT_MS = 120000
   const DEFAULT_PANEL_OPACITY = 42
+  const DEFAULT_CONTENT_FONT_SIZE = 13
+  const MIN_CONTENT_FONT_SIZE = 11
+  const MAX_CONTENT_FONT_SIZE = 20
 
   /**
    * Default models — configured with Monica's internal model IDs.
@@ -71,6 +75,13 @@
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value))
+  }
+
+  function normalizeContentFontSize(value) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed)
+      ? clamp(Math.round(parsed), MIN_CONTENT_FONT_SIZE, MAX_CONTENT_FONT_SIZE)
+      : DEFAULT_CONTENT_FONT_SIZE
   }
 
   const MODEL_ALIASES = {
@@ -168,6 +179,9 @@
       loadedModels,
     ),
     panelOpacity: clamp(Number(GM_getValue(STORAGE_KEY_PANEL_OPACITY, DEFAULT_PANEL_OPACITY)), 20, 75),
+    contentFontSize: normalizeContentFontSize(
+      GM_getValue(STORAGE_KEY_CONTENT_FONT_SIZE, DEFAULT_CONTENT_FONT_SIZE),
+    ),
     panelPosition: GM_getValue(STORAGE_KEY_PANEL_POSITION, null),
     panelSize: GM_getValue(STORAGE_KEY_PANEL_SIZE, null),
     panelVisible: false,
@@ -188,6 +202,7 @@
     GM_setValue(STORAGE_KEY_FUSION_AUTO_RUN, state.fusionAutoRun)
     GM_setValue(STORAGE_KEY_FUSION_MODEL, state.fusionModelId)
     GM_setValue(STORAGE_KEY_PANEL_OPACITY, state.panelOpacity)
+    GM_setValue(STORAGE_KEY_CONTENT_FONT_SIZE, state.contentFontSize)
     GM_setValue(STORAGE_KEY_PANEL_POSITION, state.panelPosition)
     GM_setValue(STORAGE_KEY_PANEL_SIZE, state.panelSize)
   }
@@ -1763,6 +1778,7 @@
     mainContainer = document.createElement('div')
     mainContainer.className = 'mm-main'
     mainContainer.style.setProperty('--mm-opacity', String(state.panelOpacity / 100))
+    mainContainer.style.setProperty('--mm-content-font-size', `${state.contentFontSize}px`)
     shadowRoot.appendChild(mainContainer)
     restorePanelPosition()
 
@@ -1882,6 +1898,33 @@
     opacityGroup.appendChild(opacityLabel)
     opacityGroup.appendChild(opacityInput)
     panel.appendChild(opacityGroup)
+
+    const fontSizeGroup = document.createElement('div')
+    fontSizeGroup.className = 'mm-setting-group'
+
+    const fontSizeLabel = document.createElement('label')
+    fontSizeLabel.className = 'mm-label mm-font-size-label'
+    fontSizeLabel.htmlFor = 'mm-content-font-size'
+    fontSizeLabel.textContent = `Answer font size: ${state.contentFontSize}px`
+
+    const fontSizeInput = document.createElement('input')
+    fontSizeInput.id = 'mm-content-font-size'
+    fontSizeInput.className = 'mm-range'
+    fontSizeInput.type = 'range'
+    fontSizeInput.min = String(MIN_CONTENT_FONT_SIZE)
+    fontSizeInput.max = String(MAX_CONTENT_FONT_SIZE)
+    fontSizeInput.step = '1'
+    fontSizeInput.value = String(state.contentFontSize)
+    fontSizeInput.addEventListener('input', (event) => {
+      state.contentFontSize = normalizeContentFontSize(event.target.value)
+      fontSizeLabel.textContent = `Answer font size: ${state.contentFontSize}px`
+      mainContainer?.style.setProperty('--mm-content-font-size', `${state.contentFontSize}px`)
+      persistState()
+    })
+
+    fontSizeGroup.appendChild(fontSizeLabel)
+    fontSizeGroup.appendChild(fontSizeInput)
+    panel.appendChild(fontSizeGroup)
 
     // Endpoint pattern
     const endpointGroup = document.createElement('div')
@@ -2177,6 +2220,7 @@
 
       .mm-main {
         --mm-opacity: 0.42;
+        --mm-content-font-size: 13px;
         position: fixed;
         top: 60px;
         right: 12px;
@@ -2574,16 +2618,17 @@
         overflow-y: auto;
         overflow-x: hidden;
         background: rgba(17, 20, 28, var(--mm-opacity));
+        font-size: var(--mm-content-font-size);
         line-height: 1.55;
         white-space: normal;
         overflow-wrap: anywhere;
         scrollbar-gutter: stable;
       }
 
-      .mm-panel-content h1 { font-size: 17px; margin: 12px 0 6px; color: rgba(255, 241, 242, 0.98); line-height: 1.35; }
-      .mm-panel-content h2 { font-size: 15px; margin: 11px 0 5px; color: rgba(221, 214, 254, 0.98); line-height: 1.4; }
-      .mm-panel-content h3 { font-size: 14px; margin: 10px 0 4px; color: rgba(147, 197, 253, 0.98); line-height: 1.4; }
-      .mm-panel-content h4 { font-size: 13px; margin: 8px 0 4px; color: rgba(218, 224, 240, 0.92); line-height: 1.4; }
+      .mm-panel-content h1 { font-size: 1.31em; margin: 12px 0 6px; color: rgba(255, 241, 242, 0.98); line-height: 1.35; }
+      .mm-panel-content h2 { font-size: 1.15em; margin: 11px 0 5px; color: rgba(221, 214, 254, 0.98); line-height: 1.4; }
+      .mm-panel-content h3 { font-size: 1.08em; margin: 10px 0 4px; color: rgba(147, 197, 253, 0.98); line-height: 1.4; }
+      .mm-panel-content h4 { font-size: 1em; margin: 8px 0 4px; color: rgba(218, 224, 240, 0.92); line-height: 1.4; }
 
       .mm-panel-content > :first-child { margin-top: 0; }
       .mm-panel-content > :last-child { margin-bottom: 0; }
@@ -2593,7 +2638,7 @@
         padding: 1px 5px;
         border-radius: 4px;
         font-family: 'Cascadia Code', 'Fira Code', monospace;
-        font-size: 12px;
+        font-size: 0.92em;
       }
 
       .mm-panel-content pre {
@@ -2913,6 +2958,7 @@
     state.fusionEnabled = true
     state.fusionAutoRun = true
     state.panelOpacity = DEFAULT_PANEL_OPACITY
+    state.contentFontSize = DEFAULT_CONTENT_FONT_SIZE
     state.panelPosition = null
     state.panelSize = null
     persistState()
