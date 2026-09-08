@@ -83,10 +83,21 @@ curl -X POST 'https://monica.im/实际endpoint' \
 
 ## 配置项
 
+### 自动发现和删除模型
+
+- 设置中默认开启「自动发现 Monica 置顶模型」。展开 Monica 的模型侧栏后，插件会自动把已加载的置顶模型加入 Extra Models；不会读取聊天正文来猜测模型。
+- 可手动点击「扫描置顶模型」或「扫描全部模型」。后者仅扫描页面当前已加载的模型，不是完整的服务端模型目录。
+- 新发现的模型默认不勾选并发。📌 表示置顶；「待确认」表示编号根据名称推测，例如 `Gemini 3.8 Flash` → `gemini-3.8-flash`。
+- 在 Monica 原生界面选择该模型并正常发送一次消息后，插件会从请求中校准 `use_model` 和 `chat_model`。插件不会为检测模型自动发送消息；校准也可以在多模型模式关闭时进行。
+- 每行右侧的 × 可删除模型。删除记录会保存，刷新和扫描都不会自动加回，Fusion 下拉列表也会同步移除。需要恢复时，在自定义模型输入框重新添加；「Reset Settings」会清除所有删除记录及其他设置。
+- 检测依赖 Monica 当前侧栏结构；如果页面改版或侧栏尚未加载，可使用手动添加。
+
+### 其他配置
+
 - **API Endpoint Pattern**：用于匹配聊天请求的 URL 关键词（默认 `/api/`）
 - **Request Stagger (ms)**：并发请求间隔，防止触发 rate limit（默认 200ms）
 - **Extra Models**：勾选要并发查询的模型，支持添加自定义模型
-- **Custom Model**：格式 `model-id:显示名称`
+- **Custom Model**：格式 `model-id:chat_model:显示名称`
 
 ## 注意事项
 
