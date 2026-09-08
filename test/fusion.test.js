@@ -16,11 +16,12 @@ function buildScript() {
     .readFileSync(SRC_PATH, 'utf8')
     .replace(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\s*/, '')
 
+  const runnable = process.env.WRAPPED_WINDOW === '1' ? require('./wrapped-window')(source) : source
   return `
     window.GM_getValue = (key, fallback) => key === 'monica-mm-enabled' ? true : fallback;
     window.GM_setValue = () => {};
     window.GM_registerMenuCommand = () => {};
-  ` + source
+  ` + runnable
 }
 
 function buildRequestBody() {

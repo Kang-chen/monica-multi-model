@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monica Multi-Model Compare
 // @namespace    https://monica.im/
-// @version      1.1.0-b59
+// @version      1.1.0-b62
 // @description  同一问题同时发送给多个模型，并排显示回答。复用 Monica Web 端 session，零额外成本。
 // @author       Kang
 // @match        https://monica.im/*
@@ -29,9 +29,11 @@
   // ============================================================
 
   const SCRIPT_ID = 'monica-mm'
-  const SCRIPT_VERSION = '1.1.0-b59'
+  const SCRIPT_VERSION = '1.1.0-b62'
   const STORAGE_KEY_ENABLED = `${SCRIPT_ID}-enabled`
   const STORAGE_KEY_MODELS = `${SCRIPT_ID}-models`
+  const STORAGE_KEY_REMOVED_MODELS = `${SCRIPT_ID}-removed-models`
+  const STORAGE_KEY_MODEL_DISCOVERY = `${SCRIPT_ID}-model-discovery`
   const STORAGE_KEY_ENDPOINT = `${SCRIPT_ID}-endpoint`
   const STORAGE_KEY_STAGGER = `${SCRIPT_ID}-stagger`
   const STORAGE_KEY_AUTO_RELOAD = `${SCRIPT_ID}-auto-reload`
@@ -90,7 +92,7 @@
   }
 
   function normalizeModel(model) {
-    const alias = MODEL_ALIASES[model?.id]
+    const alias = model?.verified ? null : MODEL_ALIASES[model?.id]
     const normalized = alias ? { ...model, ...alias, enabled: model.enabled } : model
     return {
       id: normalized.id,
@@ -98,6 +100,9 @@
       label: normalized.label || normalized.id,
       uiMode: normalized.uiMode || 'unknown',
       enabled: !!normalized.enabled,
+      pinned: !!normalized.pinned,
+      discovered: !!normalized.discovered,
+      verified: !!normalized.verified,
     }
   }
 
@@ -118,7 +123,7 @@
       normalized.push(next)
     }
 
-    return normalized.length ? normalized : DEFAULT_MODELS
+    return normalized
   }
 
   function mergeDefaultModels(storedModels) {
@@ -130,7 +135,7 @@
 
     for (const model of normalized) {
       const canonical = defaultById.get(model.id)
-      const next = canonical ? { ...canonical, enabled: model.enabled } : model
+      const next = canonical ? { ...canonical, ...model } : model
       if (seen.has(next.id)) continue
       seen.add(next.id)
       merged.push(next)
@@ -147,7 +152,9 @@
 
   function loadModels() {
     const storedModels = GM_getValue(STORAGE_KEY_MODELS, null)
-    const normalized = storedModels ? mergeDefaultModels(storedModels) : normalizeModels(DEFAULT_MODELS)
+    const removed = new Set(GM_getValue(STORAGE_KEY_REMOVED_MODELS, []))
+    const normalized = (storedModels ? mergeDefaultModels(storedModels) : normalizeModels(DEFAULT_MODELS))
+      .filter(model => !removed.has(model.id))
     if (storedModels) {
       GM_setValue(STORAGE_KEY_MODELS, normalized)
     }
@@ -169,6 +176,8 @@
   const state = {
     enabled: GM_getValue(STORAGE_KEY_ENABLED, false),
     models: loadedModels,
+    removedModels: GM_getValue(STORAGE_KEY_REMOVED_MODELS, []),
+    modelDiscovery: GM_getValue(STORAGE_KEY_MODEL_DISCOVERY, true),
     endpointPattern: GM_getValue(STORAGE_KEY_ENDPOINT, '/api/custom_bot/chat'),
     staggerMs: GM_getValue(STORAGE_KEY_STAGGER, DEFAULT_STAGGER_MS),
     autoReload: GM_getValue(STORAGE_KEY_AUTO_RELOAD, false),
@@ -195,6 +204,8 @@
   function persistState() {
     GM_setValue(STORAGE_KEY_ENABLED, state.enabled)
     GM_setValue(STORAGE_KEY_MODELS, state.models)
+    GM_setValue(STORAGE_KEY_REMOVED_MODELS, state.removedModels)
+    GM_setValue(STORAGE_KEY_MODEL_DISCOVERY, state.modelDiscovery)
     GM_setValue(STORAGE_KEY_ENDPOINT, state.endpointPattern)
     GM_setValue(STORAGE_KEY_STAGGER, state.staggerMs)
     GM_setValue(STORAGE_KEY_AUTO_RELOAD, state.autoReload)
@@ -205,6 +216,115 @@
     GM_setValue(STORAGE_KEY_CONTENT_FONT_SIZE, state.contentFontSize)
     GM_setValue(STORAGE_KEY_PANEL_POSITION, state.panelPosition)
     GM_setValue(STORAGE_KEY_PANEL_SIZE, state.panelSize)
+  }
+
+  // Sidebar selectors are based on Monica's rendered model rows, not chat text.
+  const MODEL_ROW_SELECTOR = '[class*="bot-item--"]'
+  // Monica uses both "Claude Opus 4.6" and "Claude 4.6 Opus".
+  const modelLabelKey = label => {
+    const text = String(label).toLowerCase()
+    return `${(text.match(/[a-z]+/g) || []).sort().join('')}:${(text.match(/\d+/g) || []).join('.')}`
+  }
+  let modelDiscoveryObserver = null
+  let modelDiscoveryTimer = null
+  let discoveryMessage = '打开 Monica 模型侧栏以检测置顶模型。'
+
+  function modelFromSidebar(row) {
+    const label = row.querySelector('[class*="bot-title--"]')?.textContent?.trim()
+    if (!label || label.length > 100 || !/^(?:GPT[ -]|Gemini |Grok |Claude |Qwen\d|GLM |DeepSeek[ -]|o\d)/i.test(label)) return null
+    const known = state.models.find(m => modelLabelKey(m.label) === modelLabelKey(label))
+      || DEFAULT_MODELS.find(m => modelLabelKey(m.label) === modelLabelKey(label))
+    // Names alone cannot prove Monica's two API keys. Keep inferred entries
+    // disabled and visibly unverified until a native request supplies both keys.
+    let id = known?.id || label.toLowerCase().replace(/\s+/g, '-')
+    if (!known && /^qwen\d/i.test(id)) id = id.replace(/^qwen/, 'qwen-')
+    const pinned = !!row.querySelector('[class*="pinned--"]')
+    return {
+      ...known, id, label, pinned, discovered: known?.discovered ?? !known,
+      chatModel: known?.chatModel || id.replace(/[.-]/g, '_'),
+      verified: known?.verified || false, enabled: known?.enabled || false,
+    }
+  }
+
+  function refreshModelSettings() {
+    const list = shadowRoot?.querySelector('.mm-models-list')
+    if (list) rebuildSettingsModels(list)
+    const status = shadowRoot?.querySelector('#mm-discovery-status')
+    if (status) status.textContent = discoveryMessage
+    syncFusionModelSelects()
+  }
+
+  function scanPageModels(includeAll = false) {
+    const rows = [...document.querySelectorAll(MODEL_ROW_SELECTOR)]
+    const found = rows.map(modelFromSidebar).filter(Boolean).map(normalizeModel)
+    let added = 0
+    let changed = false
+    for (const model of found) {
+      if (state.removedModels.includes(model.id)
+        || state.removedModels.includes(`label:${modelLabelKey(model.label)}`)) continue
+      const existing = state.models.find(m => m.id === model.id)
+      if (existing) {
+        if (!!existing.pinned !== model.pinned) {
+          existing.pinned = model.pinned
+          changed = true
+        }
+      } else if (model.pinned || includeAll) {
+        state.models.push(normalizeModel({ ...model, enabled: false }))
+        added += 1
+        changed = true
+      }
+    }
+    discoveryMessage = found.length
+      ? `检测到 ${found.length} 个模型，其中 ${found.filter(m => m.pinned).length} 个置顶；本次新增 ${added} 个。新模型默认不启用并发。`
+      : '未检测到模型侧栏，请展开 Monica 的模型列表后重试。'
+    if (changed) persistState()
+    if (changed || includeAll) refreshModelSettings()
+    else {
+      const status = shadowRoot?.querySelector('#mm-discovery-status')
+      if (status) status.textContent = discoveryMessage
+    }
+    return found
+  }
+
+  function startModelDiscovery() {
+    if (modelDiscoveryObserver) return
+    const schedule = () => {
+      if (!state.modelDiscovery || modelDiscoveryTimer) return
+      modelDiscoveryTimer = setTimeout(() => {
+        modelDiscoveryTimer = null
+        if (state.modelDiscovery) scanPageModels()
+      }, 500)
+    }
+    modelDiscoveryObserver = new MutationObserver(records => {
+      if (records.some(record => record.target.parentElement?.closest(MODEL_ROW_SELECTOR)
+        || record.target.matches?.(MODEL_ROW_SELECTOR)
+        || [...record.addedNodes].some(node => node.nodeType === 1
+          && (node.matches(MODEL_ROW_SELECTOR) || node.querySelector(MODEL_ROW_SELECTOR))))) schedule()
+    })
+    modelDiscoveryObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'], characterData: true })
+    schedule()
+  }
+
+  function learnModelFromRequest(body, label) {
+    const id = body?.data?.use_model
+    const chatModel = getCurrentQuestion(body)?.data?.chat_model
+    if (typeof id !== 'string' || typeof chatModel !== 'string'
+      || !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(id)
+      || !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(chatModel)) return
+    const existing = state.models.find(m => m.id === id)
+      || state.models.find(m => m.discovered && !m.verified && modelLabelKey(m.label) === modelLabelKey(label))
+    if (state.removedModels.includes(id) || (!existing && !state.modelDiscovery)) return
+    if (state.removedModels.includes(`label:${modelLabelKey(label)}`)) return
+    if (!existing && state.removedModels.some(removed => modelLabelKey(removed) === modelLabelKey(label))) return
+    if (existing?.verified && existing.id === id && existing.chatModel === chatModel) return
+    const previousId = existing?.id
+    const learned = { ...existing, id, chatModel, label: existing?.label || (label && label !== 'Monica' ? label : id),
+      discovered: true, verified: true, enabled: existing?.enabled || false }
+    if (existing) Object.assign(existing, learned)
+    else state.models.push(normalizeModel(learned))
+    if (previousId && state.fusionModelId === previousId) state.fusionModelId = id
+    persistState()
+    refreshModelSettings()
   }
 
   function getRunPageKey() {
@@ -564,6 +684,10 @@
                     body: bodyStr,
                     runId,
                     modelId,
+                    modelLabel: (() => {
+                      const active = document.querySelector('[class*="bot-item--"][class*="active--"] [class*="bot-title--"]')?.textContent?.trim();
+                      return active && active !== 'Monica' ? active : document.querySelector('[class*="model-name--"]')?.textContent?.trim();
+                    })(),
                   }
                 }, '*');
               }
@@ -608,6 +732,22 @@
   // Listen for captured requests from the page context
   window.addEventListener('message', (event) => {
     if (event.data?.type !== 'MONICA_MM_CAPTURED_REQUEST') return
+    // Userscript managers can wrap window; MessageEvent.source remains the
+    // native WindowProxy. Identity comparison silently drops legitimate traffic.
+    if (event.origin !== location.origin) return
+    const payload = event.data.payload
+    if (!payload || typeof payload.body !== 'string' || typeof payload.url !== 'string') return
+    try {
+      const requestUrl = new URL(payload.url, location.href)
+      // Monica's UI and chat API use different origins in production.
+      const allowedOrigin = requestUrl.origin === location.origin || requestUrl.origin === 'https://api.monica.im'
+      if (!allowedOrigin || requestUrl.username || requestUrl.password || requestUrl.pathname !== '/api/custom_bot/chat') return
+    } catch { return }
+    try {
+      learnModelFromRequest(JSON.parse(payload.body), payload.modelLabel)
+    } catch (error) {
+      console.warn(`[${SCRIPT_ID}] Model discovery failed; continuing request dispatch`, error)
+    }
     if (!state.enabled) {
       console.log(`[${SCRIPT_ID}] ⏸ Request captured but script is DISABLED (click M button to enable)`)
       return
@@ -2075,29 +2215,41 @@
 
     const modelsList = document.createElement('div')
     modelsList.className = 'mm-models-list'
-
-    state.models.forEach((model, index) => {
-      const row = document.createElement('div')
-      row.className = 'mm-model-row'
-
-      const checkbox = document.createElement('input')
-      checkbox.type = 'checkbox'
-      checkbox.checked = model.enabled
-      checkbox.id = `mm-model-${index}`
-      checkbox.addEventListener('change', (e) => {
-        state.models[index] = { ...state.models[index], enabled: e.target.checked }
-        persistState()
-      })
-
-      const label = document.createElement('label')
-      label.htmlFor = `mm-model-${index}`
-      label.textContent = `${model.label} (${model.id})`
-      label.className = 'mm-model-label'
-
-      row.appendChild(checkbox)
-      row.appendChild(label)
-      modelsList.appendChild(row)
+    const discoveryGroup = document.createElement('div')
+    discoveryGroup.className = 'mm-setting-group'
+    const autoLabel = document.createElement('label')
+    autoLabel.className = 'mm-label'
+    const autoInput = document.createElement('input')
+    autoInput.type = 'checkbox'
+    autoInput.checked = state.modelDiscovery
+    autoInput.id = 'mm-auto-discover'
+    autoInput.addEventListener('change', () => {
+      state.modelDiscovery = autoInput.checked
+      persistState()
+      if (state.modelDiscovery) scanPageModels()
     })
+    autoLabel.append(autoInput, document.createTextNode(' 自动发现 Monica 置顶模型'))
+    discoveryGroup.appendChild(autoLabel)
+    for (const [text, all] of [['扫描置顶模型', false], ['扫描全部模型', true]]) {
+      const scanButton = document.createElement('button')
+      scanButton.type = 'button'
+      scanButton.className = 'mm-btn'
+      scanButton.textContent = text
+      scanButton.addEventListener('click', () => scanPageModels(all))
+      discoveryGroup.appendChild(scanButton)
+    }
+    const discoveryStatus = document.createElement('div')
+    discoveryStatus.id = 'mm-discovery-status'
+    discoveryStatus.className = 'mm-label'
+    discoveryStatus.setAttribute('role', 'status')
+    discoveryStatus.textContent = discoveryMessage
+    discoveryGroup.appendChild(discoveryStatus)
+    const discoveryHint = document.createElement('div')
+    discoveryHint.className = 'mm-label'
+    discoveryHint.textContent = '待确认：编号由名称推测。请先在 Monica 用该模型发送一次消息以校准；不会自动发送测试消息。删除后不会自动加回，可在下方手动重新添加。'
+    discoveryGroup.appendChild(discoveryHint)
+    panel.appendChild(discoveryGroup)
+    rebuildSettingsModels(modelsList)
 
     panel.appendChild(modelsList)
 
@@ -2127,10 +2279,13 @@
       const val = customInput.value.trim()
       if (!val) return
       const parts = val.split(':')
-      const id = parts[0]?.trim()
+      const id = normalizeModel({ id: parts[0]?.trim() }).id
       const chatModel = parts[1]?.trim() || id.replace(/-/g, '_')
       const label = parts.slice(2).join(':').trim() || id
-      state.models = [...state.models, { id, chatModel, label, enabled: true }]
+      state.removedModels = state.removedModels.filter(removed => removed !== id && removed !== `label:${modelLabelKey(label)}`)
+      const existing = state.models.find(m => m.id === id)
+      if (existing) Object.assign(existing, { chatModel, label, enabled: true, discovered: false })
+      else state.models.push({ id, chatModel, label, enabled: true })
       persistState()
       // Rebuild settings panel
       rebuildSettingsModels(modelsList)
@@ -2181,13 +2336,17 @@
 
       const label = document.createElement('label')
       label.htmlFor = `mm-model-${index}`
-      label.textContent = `${model.label} (${model.id})`
+      label.textContent = `${model.pinned ? '📌 ' : ''}${model.label} (${model.id})${model.discovered && !model.verified ? ' · 待确认' : ''}`
       label.className = 'mm-model-label'
 
       const removeBtn = document.createElement('button')
       removeBtn.textContent = '×'
       removeBtn.className = 'mm-btn-remove'
+      removeBtn.type = 'button'
+      removeBtn.title = `删除 ${model.label}`
+      removeBtn.setAttribute('aria-label', `删除 ${model.label}`)
       removeBtn.addEventListener('click', () => {
+        state.removedModels = [...new Set([...state.removedModels, model.id, `label:${modelLabelKey(model.label)}`])]
         state.models = state.models.filter((_, i) => i !== index)
         state.fusionModelId = normalizeFusionModelId(state.fusionModelId, state.models)
         persistState()
@@ -2952,6 +3111,8 @@
   })
 
   GM_registerMenuCommand('Reset Settings', () => {
+    state.removedModels = []
+    state.modelDiscovery = true
     state.models = normalizeModels(DEFAULT_MODELS)
     state.endpointPattern = '/api/custom_bot/chat'
     state.staggerMs = DEFAULT_STAGGER_MS
@@ -3215,6 +3376,7 @@
       ensurePanelVisible()
     }
     startUiWatchdog()
+    startModelDiscovery()
 
     console.log(`[${SCRIPT_ID}] Initialized. Enabled: ${state.enabled}`)
   }
