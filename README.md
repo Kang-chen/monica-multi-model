@@ -99,6 +99,14 @@ curl -X POST 'https://monica.im/实际endpoint' \
 - **Extra Models**：勾选要并发查询的模型，支持添加自定义模型
 - **Custom Model**：格式 `model-id:chat_model:显示名称`
 
+## 回归验证
+
+运行 `node test/regression.test.js`，可通过 `PLAYWRIGHT_MODULE` 指定 Playwright 模块路径。浏览器测试需要本机 Chrome，Fusion 渲染测试需要联网加载脚本使用的 CDN 依赖。
+
+统一入口覆盖请求桥接、模型配置、构建版本、UI 生命周期、模型发现/删除/恢复，以及普通窗口和包装窗口中的并发与 Fusion。包装窗口测试保留原生 `MessageEvent.source`，用于防止 userscript 的窗口包装导致消息被误丢弃；校准异常也不应阻断请求分发。
+
+这些测试使用模拟回答，不能替代实际 Tampermonkey 安装验收。发布前仍应安装新版本，在 Monica 发送短消息，确认原生回答、并发模型、自动 Fusion 和手动重跑均可完成。
+
 ## 注意事项
 
 - 逆向使用内部 API 可能违反 Monica ToS，仅供个人学习使用

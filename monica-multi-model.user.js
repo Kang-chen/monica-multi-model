@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monica Multi-Model Compare
 // @namespace    https://monica.im/
-// @version      1.1.0-b60
+// @version      1.1.0-b61
 // @description  同一问题同时发送给多个模型，并排显示回答。复用 Monica Web 端 session，零额外成本。
 // @author       Kang
 // @match        https://monica.im/*
@@ -29,7 +29,7 @@
   // ============================================================
 
   const SCRIPT_ID = 'monica-mm'
-  const SCRIPT_VERSION = '1.1.0-b60'
+  const SCRIPT_VERSION = '1.1.0-b61'
   const STORAGE_KEY_ENABLED = `${SCRIPT_ID}-enabled`
   const STORAGE_KEY_MODELS = `${SCRIPT_ID}-models`
   const STORAGE_KEY_REMOVED_MODELS = `${SCRIPT_ID}-removed-models`
@@ -732,10 +732,20 @@
   // Listen for captured requests from the page context
   window.addEventListener('message', (event) => {
     if (event.data?.type !== 'MONICA_MM_CAPTURED_REQUEST') return
-    if (event.source !== window) return
+    // Userscript managers can wrap window; MessageEvent.source remains the
+    // native WindowProxy. Identity comparison silently drops legitimate traffic.
+    if (event.origin !== location.origin) return
+    const payload = event.data.payload
+    if (!payload || typeof payload.body !== 'string' || typeof payload.url !== 'string') return
     try {
-      learnModelFromRequest(JSON.parse(event.data.payload.body), event.data.payload.modelLabel)
-    } catch {}
+      const requestUrl = new URL(payload.url, location.href)
+      if (requestUrl.origin !== location.origin || requestUrl.pathname !== '/api/custom_bot/chat') return
+    } catch { return }
+    try {
+      learnModelFromRequest(JSON.parse(payload.body), payload.modelLabel)
+    } catch (error) {
+      console.warn(`[${SCRIPT_ID}] Model discovery failed; continuing request dispatch`, error)
+    }
     if (!state.enabled) {
       console.log(`[${SCRIPT_ID}] ⏸ Request captured but script is DISABLED (click M button to enable)`)
       return

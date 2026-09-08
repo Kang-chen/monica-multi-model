@@ -20,7 +20,7 @@ window.GM_setValue = (key, value) => localStorage.setItem(key, JSON.stringify(va
 window.GM_registerMenuCommand = () => {};
 if (!crypto.randomUUID) crypto.randomUUID = () => '00000000-0000-4000-8000-000000000001';
 window.fetch = async () => new Response('data: [DONE]\\n\\n', { headers: { 'Content-Type': 'text/event-stream' } });
-` + source
+` + (process.env.WRAPPED_WINDOW === '1' ? require('./wrapped-window')(source) : source)
 
 async function models(page) {
   return page.evaluate(() => JSON.parse(localStorage.getItem('monica-mm-models')) || [])
@@ -95,6 +95,14 @@ async function models(page) {
     await root.getByRole('button', { name: '删除 Gemini 3.8 Flash', exact: true }).click()
     await root.getByRole('button', { name: '扫描置顶模型', exact: true }).click()
     assert(!(await models(page)).some(m => m.label === 'Gemini 3.8 Flash'), 'deleted calibrated model stays deleted')
+    assert.strictEqual(await root.locator('#mm-fusion-model option[value="gemini-3.8-flash-thinking"]').count(), 0, 'deletion updates Fusion choices')
+    const custom = root.getByPlaceholder('model-id:chat_model_key:Display Name')
+    await custom.fill('gemini-3.8-flash-thinking:gemini_3_8_flash:Gemini 3.8 Flash')
+    await root.locator('.mm-btn-add').click()
+    await root.getByRole('button', { name: '扫描置顶模型', exact: true }).click()
+    assert.strictEqual((await models(page)).filter(m => m.label === 'Gemini 3.8 Flash').length, 1, 'manual restoration and scanning do not duplicate')
+    assert.strictEqual(await root.locator('#mm-fusion-model option[value="gemini-3.8-flash-thinking"]').count(), 1, 'restoration updates Fusion choices')
+    await root.getByRole('button', { name: '删除 Gemini 3.8 Flash', exact: true }).click()
 
     await root.locator('#mm-auto-discover').uncheck()
     await page.evaluate(() => {
