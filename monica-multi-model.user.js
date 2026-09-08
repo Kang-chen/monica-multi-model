@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monica Multi-Model Compare
 // @namespace    https://monica.im/
-// @version      1.1.0-b61
+// @version      1.1.0-b62
 // @description  同一问题同时发送给多个模型，并排显示回答。复用 Monica Web 端 session，零额外成本。
 // @author       Kang
 // @match        https://monica.im/*
@@ -29,7 +29,7 @@
   // ============================================================
 
   const SCRIPT_ID = 'monica-mm'
-  const SCRIPT_VERSION = '1.1.0-b61'
+  const SCRIPT_VERSION = '1.1.0-b62'
   const STORAGE_KEY_ENABLED = `${SCRIPT_ID}-enabled`
   const STORAGE_KEY_MODELS = `${SCRIPT_ID}-models`
   const STORAGE_KEY_REMOVED_MODELS = `${SCRIPT_ID}-removed-models`
@@ -739,7 +739,9 @@
     if (!payload || typeof payload.body !== 'string' || typeof payload.url !== 'string') return
     try {
       const requestUrl = new URL(payload.url, location.href)
-      if (requestUrl.origin !== location.origin || requestUrl.pathname !== '/api/custom_bot/chat') return
+      // Monica's UI and chat API use different origins in production.
+      const allowedOrigin = requestUrl.origin === location.origin || requestUrl.origin === 'https://api.monica.im'
+      if (!allowedOrigin || requestUrl.username || requestUrl.password || requestUrl.pathname !== '/api/custom_bot/chat') return
     } catch { return }
     try {
       learnModelFromRequest(JSON.parse(payload.body), payload.modelLabel)

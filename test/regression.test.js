@@ -5,10 +5,11 @@ const cases = [
   ['request-bridge.test.js'], ['model-config.test.js'], ['build.test.js'],
   ['ui-lifecycle.test.js'], ['model-discovery.test.js'], ['fusion.test.js'],
   ['model-discovery.test.js', '1'], ['fusion.test.js', '1'],
+  ['dev-browser.js', '0', '--fixture', '--headless'],
 ]
-for (const [file, wrapped = '0'] of cases) {
+for (const [file, wrapped = '0', ...args] of cases) {
   console.log(`Running ${file} (wrapped window: ${wrapped})`)
-  const result = spawnSync(process.execPath, [path.join(__dirname, file)], {
+  const result = spawnSync(process.execPath, [path.join(__dirname, file), ...args], {
     env: { ...process.env, WRAPPED_WINDOW: wrapped }, stdio: 'inherit',
   })
   if (result.error) console.error(result.error)

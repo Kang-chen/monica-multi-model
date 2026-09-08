@@ -101,6 +101,20 @@ curl -X POST 'https://monica.im/实际endpoint' \
 
 ## 回归验证
 
+### 独立开发浏览器（不需要 Tampermonkey）
+
+运行 `node test/dev-browser.js`，会启动独立的可见 Chrome，使用项目下 `.dev/monica-profile` 专用配置，不连接日常浏览器，也不复制现有账号。首次需要在新窗口登录 Monica。可用 `DEV_CHROME_PATH` 指定 Chrome for Testing / Chromium 可执行文件。
+
+开发入口会校验并缓存 userscript 的依赖，在页面加载前自动注入当前本地代码和开发用 GM 适配层。修改 `monica-multi-model.user.js` 后自动刷新加载新代码，无需重复安装。正在执行自动测试时会延迟刷新。请勿用此窗口处理重要对话或未保存的草稿。
+
+终端输入 `status` 查看注入、聊天请求数量及模型/Fusion 面板状态；输入 `test` 发送一条简短真实消息并检查所有面板完成（会消耗当前勾选模型的额度）；`reload` 手动重新加载，`quit` 关闭开发实例。日志不记录聊天内容或请求凭据。开发配置与 Tampermonkey 的模型设置相互独立。
+
+运行 `node test/dev-browser.js --fixture --headless`，可在同一个自动注入入口中使用本地模拟服务验证开发环境，无需账号。模拟服务测试通过不代表 Monica 实网或 Tampermonkey 安装验收通过。
+
+`.dev/` 已加入 Git 忽略列表，其中可能包含开发浏览器登录状态，请勿提交或分享。这个入口不修改浏览器安全策略，不安装扩展，也不覆盖当前 Chrome 的配置。
+
+### 自动回归
+
 运行 `node test/regression.test.js`，可通过 `PLAYWRIGHT_MODULE` 指定 Playwright 模块路径。浏览器测试需要本机 Chrome，Fusion 渲染测试需要联网加载脚本使用的 CDN 依赖。
 
 统一入口覆盖请求桥接、模型配置、构建版本、UI 生命周期、模型发现/删除/恢复，以及普通窗口和包装窗口中的并发与 Fusion。包装窗口测试保留原生 `MessageEvent.source`，用于防止 userscript 的窗口包装导致消息被误丢弃；校准异常也不应阻断请求分发。

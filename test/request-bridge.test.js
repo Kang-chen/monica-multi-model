@@ -30,11 +30,16 @@ function run({ origin = 'https://monica.im', url = '/api/custom_bot/chat',
 }
 
 assert.strictEqual(run().dispatched, 1, 'wrapped window must not block native capture')
+assert.strictEqual(run({ url: 'https://api.monica.im/api/custom_bot/chat' }).dispatched, 1, 'production API subdomain must dispatch')
 assert.strictEqual(run({ discoveryThrows: true }).dispatched, 1, 'discovery failure must not block dispatch')
 assert.deepStrictEqual(run({ enabled: false }), { dispatched: 0, learned: 1 }, 'disabled concurrency still calibrates')
 for (const input of [
   { origin: 'https://attacker.test' }, { origin: '' },
   { url: 'https://attacker.test/api/custom_bot/chat' }, { url: '/unrelated' }, { payloadMissing: true },
+  { url: 'https://api.monica.im.attacker.test/api/custom_bot/chat' },
+  { url: 'http://api.monica.im/api/custom_bot/chat' },
+  { url: 'https://api.monica.im:8443/api/custom_bot/chat' },
+  { url: 'https://user@api.monica.im/api/custom_bot/chat' },
 ]) assert.deepStrictEqual(run(input), { dispatched: 0, learned: 0 }, 'reject foreign or malformed messages')
 assert.strictEqual(run({ body: 'not json' }).dispatched, 0, 'invalid JSON never dispatches')
 console.log('request-bridge tests passed')
